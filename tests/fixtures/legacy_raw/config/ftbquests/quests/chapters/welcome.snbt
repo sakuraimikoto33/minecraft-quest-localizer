@@ -1,0 +1,28 @@
+{
+  id: "00000000000000A1"
+  title: "Welcome &6Home&r"
+  subtitle: "First chapter"
+  icon: "minecraft:book"
+  images: [{
+    id: "00000000000000A2"
+    hover: ["Hover text"]
+  }]
+  quests: [{
+    id: "1111111111111111"
+    title: "Getting Started"
+    subtitle: "&eFirst steps&r"
+    description: [
+      "Use &aMekanism&r."
+      ""
+      "{@pagebreak}"
+      "{existing.translation.key}"
+      "{\"text\":\"Open docs\",\"color\":\"gold\",\"bold\":true,\"clickEvent\":{\"action\":\"open_url\",\"value\":\"https://example.invalid/docs\"},\"hoverEvent\":{\"action\":\"show_text\",\"contents\":{\"text\":\"Tooltip\"}},\"extra\":[{\"text\":\" now\",\"italic\":true}]}"
+    ]
+    tasks: [{
+      id: "2222222222222222"
+      type: "item"
+      item: "example:widget"
+      title: "Craft &bWidget&r"
+    }]
+  }]
+}

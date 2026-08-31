@@ -1,0 +1,9 @@
+{
+  quest.00000000000000A1.title: "&6Welcome&r"
+  quest.00000000000000A1.quest_desc: [
+    "&aFirst line&r"
+    ""
+    "Second line\ncontinued"
+  ]
+  task.00000000000000B2.title: "&bMachine&r"
+}

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=65.5", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minecraft-quest-localizer"
+version = "1.0.0"
+description = "OpenAI-powered, non-destructive localizer for Minecraft quest data"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Minecraft Quest Localizer contributors" }]
+dependencies = []
+
+[project.gui-scripts]
+minecraft-quest-localizer = "mq_localizer.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,6 @@
+{
+  chapter_groups: [{
+    id: "0000000000000001"
+    title: "Main Group"
+  }]
+}
