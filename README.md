@@ -4,8 +4,6 @@ MinecraftのModpackで使われるFTB Questsを、OpenAI APIで翻訳するロ�
 
 選択した項目の翻訳結果だけを翻訳先localeへ書きます。1.20.x以前の直書きquest SNBTだけは、locale化のため原本を `quests.bak` へ保存し、キー化した `quests` を作ります。
 
-現在の翻訳対象はFTB Questsです。Better QuestingやMod単体の翻訳を将来追加できるアダプター構成になっています。
-
 ## 必要なもの
 
 - ソースから起動する場合はPython 3.11以降（外部Pythonパッケージは不要）
