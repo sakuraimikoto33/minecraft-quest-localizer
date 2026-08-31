@@ -103,11 +103,12 @@ _FORMAT_CODE = re.compile(_FORMAT_CODE_PATTERN, re.IGNORECASE)
 
 @dataclass(frozen=True, slots=True)
 class TermReplacement:
-    """One occurrence-specific terminology replacement in source offsets."""
+    """One terminology replacement and its optional logical-match group."""
 
     start: int
     end: int
     replacement: str
+    group_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +117,7 @@ class _Span:
     end: int
     replacement: str
     kind: str
+    term_group_id: int | None = None
 
 
 def _special_spans(text: str) -> tuple[_Span, ...]:
@@ -257,7 +259,9 @@ class ProtectedText:
     special_source_spans: tuple[tuple[int, int], ...]
     term_placeholders: tuple[str, ...]
     term_source_spans: tuple[tuple[int, int], ...]
+    term_group_ids: tuple[int | None, ...]
     structural_placeholders: tuple[str, ...]
+    flexible_structural_placeholders: tuple[str, ...]
     layout_segment_signatures: tuple[
         tuple[bool, tuple[tuple[str, int], ...]], ...
     ]
@@ -322,7 +326,12 @@ class ProtectedText:
             translated_signatures = tuple(
                 _segment_signature(segment) for segment in translated_segments
             )
-            if translated_signatures != self.layout_segment_signatures:
+            if not _layout_segment_signatures_match(
+                self.layout_segment_signatures,
+                translated_signatures,
+                self.structural_placeholders,
+                frozenset(self.flexible_structural_placeholders),
+            ):
                 raise TranslationError(
                     "改行やタブをまたいで翻訳本文または保護対象が移動しました"
                 )
@@ -476,7 +485,15 @@ class TokenProtector:
                 if terminology_target_is_safe(source, term.replacement)
                 else source
             )
-            spans.append(_Span(term.start, term.end, safe_target, "term"))
+            spans.append(
+                _Span(
+                    term.start,
+                    term.end,
+                    safe_target,
+                    "term",
+                    term.group_id,
+                )
+            )
             occupied.append((term.start, term.end))
         for source, target in sorted((terminology or {}).items(), key=lambda item: len(item[0]), reverse=True):
             if not source:
@@ -523,6 +540,7 @@ class TokenProtector:
         special_source_spans: list[tuple[int, int]] = []
         term_placeholders: list[str] = []
         term_source_spans: list[tuple[int, int]] = []
+        term_group_ids: list[int | None] = []
         fixed_layout_placeholders: list[str] = []
         cursor = 0
         placeholder_index = 0
@@ -552,11 +570,36 @@ class TokenProtector:
             elif span.kind == "term":
                 term_placeholders.append(placeholder)
                 term_source_spans.append((span.start, span.end))
+                term_group_ids.append(span.term_group_id)
             cursor = span.end
         chunks.append(text[cursor:])
 
         protected = "".join(chunks)
         structural_placeholders = tuple(fixed_layout_placeholders)
+        flexible_structural_placeholders: list[str] = []
+        grouped_term_spans: dict[int, list[tuple[int, int]]] = {}
+        for source_span, group_id in zip(
+            term_source_spans,
+            term_group_ids,
+            strict=True,
+        ):
+            if group_id is not None:
+                grouped_term_spans.setdefault(group_id, []).append(source_span)
+        for placeholder, source_span, value in zip(
+            special_placeholders,
+            special_source_spans,
+            special_values,
+            strict=True,
+        ):
+            if value != r"\&" or placeholder not in structural_placeholders:
+                continue
+            special_start, special_end = source_span
+            if any(
+                any(term_end == special_start for _term_start, term_end in spans)
+                and any(term_start == special_end for term_start, _term_end in spans)
+                for spans in grouped_term_spans.values()
+            ):
+                flexible_structural_placeholders.append(placeholder)
         protected_segments = _split_on_placeholders(
             protected,
             structural_placeholders,
@@ -571,17 +614,21 @@ class TokenProtector:
         )
 
         return ProtectedText(
-            text,
-            protected,
-            replacements,
-            tuple(special_values),
-            tuple(special_placeholders),
-            tuple(special_source_spans),
-            tuple(term_placeholders),
-            tuple(term_source_spans),
-            structural_placeholders,
-            layout_segment_signatures,
-            formatting_segments,
+            original=text,
+            protected=protected,
+            replacements=replacements,
+            special_values=tuple(special_values),
+            special_placeholders=tuple(special_placeholders),
+            special_source_spans=tuple(special_source_spans),
+            term_placeholders=tuple(term_placeholders),
+            term_source_spans=tuple(term_source_spans),
+            term_group_ids=tuple(term_group_ids),
+            structural_placeholders=structural_placeholders,
+            flexible_structural_placeholders=tuple(
+                flexible_structural_placeholders
+            ),
+            layout_segment_signatures=layout_segment_signatures,
+            formatting_segments=formatting_segments,
         )
 
 
@@ -1030,10 +1077,11 @@ def protected_layout_signature(
 ) -> tuple[object, ...]:
     """Describe fixed lines and safely movable closed formatting groups.
 
-    Newlines/tabs/escaped ampersands retain their exact segment.  A simple
-    ``format...reset`` group may move as one unit inside that segment, which is
-    required for natural Japanese word order.  Orphan resets, unclosed codes,
-    and complex mid-body style changes retain strict source positions.
+    Newlines and tabs retain their exact segment. Escaped ampersands do too,
+    except that prose may move across an ampersand held between two fragments
+    of the same protected name. A simple ``format...reset`` group may move as
+    one unit inside a segment. Orphan resets, unclosed codes, and complex
+    mid-body style changes retain strict source positions.
     """
 
     protected = TokenProtector().protect(text, terminology, term_spans)
@@ -1046,25 +1094,44 @@ def protected_layout_signature(
         protected.replacements[placeholder]
         for placeholder in protected.structural_placeholders
     )
-    segment_signatures = tuple(
-        (
+    flexible = frozenset(protected.flexible_structural_placeholders)
+    canonical_segments: list[tuple[bool, tuple[tuple[str, str], ...]]] = []
+    formatting_signatures: list[tuple[object, ...]] = []
+    for segment, formatting in zip(
+        segments,
+        protected.formatting_segments,
+        strict=True,
+    ):
+        canonical_segments.append(
             _canonical_segment_signature(
                 segment,
                 protected.replacements,
                 special,
-            ),
+            )
+        )
+        formatting_signatures.append(
             _canonical_formatting_signature(
                 segment,
                 formatting,
                 protected.replacements,
                 special,
-            ),
+            )
         )
-        for segment, formatting in zip(
-            segments,
-            protected.formatting_segments,
-            strict=True,
+    component_body_by_segment: dict[int, bool] = {}
+    for component in _flexible_segment_components(
+        len(segments),
+        protected.structural_placeholders,
+        flexible,
+    ):
+        component_body = any(canonical_segments[index][0] for index in component)
+        for index in component:
+            component_body_by_segment[index] = component_body
+    segment_signatures = tuple(
+        (
+            (component_body_by_segment[index], canonical_segments[index][1]),
+            formatting_signatures[index],
         )
+        for index in range(len(segments))
     )
     return fixed_values, segment_signatures
 
@@ -1308,6 +1375,58 @@ def _segment_signature(segment: str) -> tuple[bool, tuple[tuple[str, int], ...]]
     visible = _PLACEHOLDER_RE.sub("", segment)
     has_meaningful_body = any(character.isalnum() for character in visible)
     return has_meaningful_body, tuple(sorted(Counter(placeholders).items()))
+
+
+def _layout_segment_signatures_match(
+    expected: tuple[tuple[bool, tuple[tuple[str, int], ...]], ...],
+    observed: tuple[tuple[bool, tuple[tuple[str, int], ...]], ...],
+    boundaries: tuple[str, ...],
+    flexible_boundaries: frozenset[str],
+) -> bool:
+    r"""Compare fixed segments while allowing prose around one grouped ``\&``.
+
+    An escaped ampersand embedded in a single protected project name remains
+    fixed between that name's two terminology fragments. Ordinary prose may
+    move from one side of the complete name to the other, but the grouped
+    segments must retain prose as a whole. Newlines, tabs, ungrouped
+    ampersands, and all protected-placeholder membership remain strict.
+    """
+
+    if len(expected) != len(observed) or len(expected) != len(boundaries) + 1:
+        return False
+    for expected_segment, observed_segment in zip(expected, observed, strict=True):
+        _expected_body, expected_placeholders = expected_segment
+        _observed_body, observed_placeholders = observed_segment
+        if expected_placeholders != observed_placeholders:
+            return False
+    for component in _flexible_segment_components(
+        len(expected),
+        boundaries,
+        flexible_boundaries,
+    ):
+        expected_body = any(expected[index][0] for index in component)
+        observed_body = any(observed[index][0] for index in component)
+        if expected_body != observed_body:
+            return False
+    return True
+
+
+def _flexible_segment_components(
+    segment_count: int,
+    boundaries: tuple[str, ...],
+    flexible_boundaries: frozenset[str],
+) -> tuple[tuple[int, ...], ...]:
+    if segment_count != len(boundaries) + 1:
+        return ()
+    components: list[tuple[int, ...]] = []
+    component_start = 0
+    for boundary_index, boundary in enumerate(boundaries):
+        if boundary in flexible_boundaries:
+            continue
+        components.append(tuple(range(component_start, boundary_index + 1)))
+        component_start = boundary_index + 1
+    components.append(tuple(range(component_start, segment_count)))
+    return tuple(components)
 
 
 def _is_layout_token(value: str) -> bool:

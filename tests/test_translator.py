@@ -320,6 +320,39 @@ class AtomicStyledTermsClient(PrefixClient):
         return result
 
 
+class GroupedSemanticTermClient(PrefixClient):
+    def translate_batch(
+        self,
+        api_key: str,
+        model: str,
+        items: list[dict[str, Any]],
+        source_locale: str,
+        target_locale: str,
+        cancel: object = None,
+    ) -> dict[str, str]:
+        del api_key, model, source_locale, target_locale, cancel
+        self.calls.append(items)  # type: ignore[arg-type]
+        result: dict[str, str] = {}
+        for item in items:
+            bindings = {
+                binding["source_term"]: binding["token"]
+                for binding in item.get("term_bindings", [])
+            }
+            if r"Planets \& Dimensions" in bindings:
+                result[item["id"]] = (
+                    bindings[r"Planets \& Dimensions"]
+                    + "の章で詳しい情報を確認できます！"
+                )
+            else:
+                result[item["id"]] = (
+                    bindings["Repair Pylon"]
+                    + "と"
+                    + bindings["Spirit Crucible"]
+                    + "を組み合わせると、アイテムを修復できます。"
+                )
+        return result
+
+
 class UnderGardenTitleClient(PrefixClient):
     def translate_batch(
         self,
@@ -427,14 +460,14 @@ class OverlappingTermClient(PrefixClient):
         self.calls.append(items)
         result: dict[str, str] = {}
         for item in items:
-            tokens = [
-                binding["token"] for binding in item.get("term_bindings", [])
-            ]
+            bindings = {
+                binding["source_term"]: binding["token"]
+                for binding in item.get("term_bindings", [])
+            }
             result[item["id"]] = (
-                tokens[0]
-                + tokens[1]
+                bindings["Rainbow Sword"]
                 + "と"
-                + tokens[2]
+                + bindings["Sword"]
                 + "を使う"
             )
         return result
@@ -1433,6 +1466,262 @@ class TranslationServiceTests(unittest.TestCase):
         )
         self.assertEqual((outcome.translated, outcome.reused), (1, 0))
 
+    def test_term_split_by_formatting_is_one_provider_semantic_unit(self) -> None:
+        source = (
+            "When paired with a &dSpirit&r Crucible, the &aRepair Pylon&r "
+            "allows items to be repaired."
+        )
+        glossary = GlossaryCatalog(
+            entries={
+                name: GlossaryEntry(
+                    source=name,
+                    target=name,
+                    key=f"block.example.{index}",
+                    mod_id="example",
+                    translated=False,
+                    provenance="example.jar!/assets/example/lang/en_us.json",
+                )
+                for index, name in enumerate(("Spirit Crucible", "Repair Pylon"))
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = _categorized_project(
+                root,
+                [
+                    (
+                        "description",
+                        "mq_localizer.quest.5605f9aacca63ad3.description.2",
+                        source,
+                        "quest_description",
+                    )
+                ],
+            )
+            client = GroupedSemanticTermClient()
+            adapter = RecordingAdapter()
+
+            outcome = TranslationService(client).translate(
+                project,
+                adapter,
+                project.default_output,
+                "sk-test",
+                "gpt-test",
+                glossary,
+                TranslationOptions(),
+            )
+
+        self.assertEqual(len(client.calls), 1, "固有名詞断片の分離で再試行しない")
+        item = client.calls[0][0]
+        self.assertEqual(
+            [binding["source_term"] for binding in item["term_bindings"]],
+            ["Spirit Crucible", "Repair Pylon"],
+        )
+        self.assertEqual(len(_PROTECTED_TOKEN.findall(item["text"])), 2)
+        self.assertNotIn("Spirit", item["text"])
+        self.assertEqual(
+            adapter.calls[0][1]["description"],
+            "&aRepair Pylon&rと&dSpirit&r Crucibleを組み合わせると、"
+            "アイテムを修復できます。",
+        )
+        self.assertEqual((outcome.translated, outcome.reused), (1, 0))
+
+    def test_term_inside_partial_format_scope_is_not_collapsed(self) -> None:
+        source = "&aPrefix Spirit&r Crucible end"
+        glossary = GlossaryCatalog(
+            entries={
+                "Spirit Crucible": GlossaryEntry(
+                    source="Spirit Crucible",
+                    target="Spirit Crucible",
+                    key="block.example.spirit_crucible",
+                    mod_id="example",
+                    translated=False,
+                    provenance="example.jar!/assets/example/lang/en_us.json",
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = _categorized_project(
+                root,
+                [
+                    (
+                        "description",
+                        "mq_localizer.quest.partial_scope.description.0",
+                        source,
+                        "quest_description",
+                    )
+                ],
+            )
+            client = PrefixClient()
+            adapter = RecordingAdapter()
+
+            outcome = TranslationService(client).translate(
+                project,
+                adapter,
+                project.default_output,
+                "sk-test",
+                "gpt-test",
+                glossary,
+                TranslationOptions(),
+            )
+
+        self.assertEqual(len(client.calls), 1)
+        item = client.calls[0][0]
+        self.assertEqual(
+            [binding["source_term"] for binding in item["term_bindings"]],
+            ["Spirit", " Crucible"],
+        )
+        self.assertEqual(len(_PROTECTED_TOKEN.findall(item["text"])), 4)
+        self.assertEqual((outcome.translated, outcome.reused), (1, 0))
+
+    def test_grouped_term_inside_unclosed_format_scope_is_not_collapsed(self) -> None:
+        source = r"Intro &aPrefix Planets \& Dimensions end"
+        glossary = GlossaryCatalog().with_source_preserved_terms(
+            [r"Planets \& Dimensions"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = _categorized_project(
+                root,
+                [
+                    (
+                        "description",
+                        "mq_localizer.quest.unclosed_scope.description.0",
+                        source,
+                        "quest_description",
+                    )
+                ],
+            )
+            client = PrefixClient()
+
+            outcome = TranslationService(client).translate(
+                project,
+                RecordingAdapter(),
+                project.default_output,
+                "sk-test",
+                "gpt-test",
+                glossary,
+                TranslationOptions(),
+            )
+
+        self.assertEqual(len(client.calls), 1)
+        item = client.calls[0][0]
+        self.assertEqual(
+            [binding["source_term"] for binding in item["term_bindings"]],
+            ["Planets ", " Dimensions"],
+        )
+        self.assertEqual(len(_PROTECTED_TOKEN.findall(item["text"])), 4)
+        self.assertEqual((outcome.translated, outcome.reused), (1, 0))
+
+    def test_project_name_split_by_escaped_ampersand_translates_without_retry(
+        self,
+    ) -> None:
+        source = (
+            r'More information can be found in the "Planets \& Dimensions" '
+            "chapter!"
+        )
+        glossary = GlossaryCatalog().with_source_preserved_terms(
+            [r"Planets \& Dimensions"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = _categorized_project(
+                root,
+                [
+                    (
+                        "description",
+                        "mq_localizer.quest.04b3aa8f91eb10f3.description.4",
+                        source,
+                        "quest_description",
+                    )
+                ],
+            )
+            client = GroupedSemanticTermClient()
+            adapter = RecordingAdapter()
+
+            outcome = TranslationService(client).translate(
+                project,
+                adapter,
+                project.default_output,
+                "sk-test",
+                "gpt-test",
+                glossary,
+                TranslationOptions(),
+            )
+            existing_value = (
+                r"Planets \& Dimensionsの章で詳しい情報を確認できます！"
+            )
+            existing_project = _categorized_project(
+                root,
+                [
+                    (
+                        "description",
+                        "mq_localizer.quest.04b3aa8f91eb10f3.description.4",
+                        source,
+                        "quest_description",
+                    )
+                ],
+                existing={"description": existing_value},
+            )
+            reuse_client = GroupedSemanticTermClient()
+            reuse_outcome = TranslationService(reuse_client).translate(
+                existing_project,
+                RecordingAdapter(),
+                existing_project.default_output,
+                "sk-test",
+                "gpt-test",
+                glossary,
+                TranslationOptions(),
+            )
+            missing_body_project = _categorized_project(
+                root,
+                [
+                    (
+                        "description",
+                        "mq_localizer.quest.04b3aa8f91eb10f3.description.4",
+                        source,
+                        "quest_description",
+                    )
+                ],
+                existing={"description": r"Planets \& Dimensions"},
+            )
+            missing_body_client = GroupedSemanticTermClient()
+            missing_body_outcome = TranslationService(missing_body_client).translate(
+                missing_body_project,
+                RecordingAdapter(),
+                missing_body_project.default_output,
+                "sk-test",
+                "gpt-test",
+                glossary,
+                TranslationOptions(),
+            )
+
+        self.assertEqual(len(client.calls), 1, "escaped ampersandで再試行しない")
+        self.assertEqual(reuse_client.calls, [], "安全な既存訳を再翻訳しない")
+        self.assertEqual((reuse_outcome.reused, reuse_outcome.translated), (1, 0))
+        self.assertEqual(len(missing_body_client.calls), 1, "本文欠落の既存訳は再翻訳する")
+        self.assertEqual(
+            (missing_body_outcome.reused, missing_body_outcome.translated),
+            (0, 1),
+        )
+        item = client.calls[0][0]
+        self.assertEqual(
+            item["term_bindings"],
+            [
+                {
+                    "token": item["term_bindings"][0]["token"],
+                    "source_term": r"Planets \& Dimensions",
+                    "approved_output": r"Planets \& Dimensions",
+                }
+            ],
+        )
+        self.assertEqual(len(_PROTECTED_TOKEN.findall(item["text"])), 1)
+        self.assertEqual(
+            adapter.calls[0][1]["description"],
+            r"Planets \& Dimensionsの章で詳しい情報を確認できます！",
+        )
+        self.assertEqual((outcome.translated, outcome.reused), (1, 0))
+
     def test_real_openai_client_restores_reported_atomic_styled_terms(self) -> None:
         source = (
             "Use the &2Element Binder&r to create this ingot ! "
@@ -2169,9 +2458,73 @@ class TranslationServiceTests(unittest.TestCase):
                     prefix + "これを作る",
                 )
 
+    def test_reported_terminal_unclosed_style_is_appended_locally(self) -> None:
+        class TerminalStyleClient(PrefixClient):
+            def translate_batch(
+                self,
+                api_key: str,
+                model: str,
+                items: list[dict[str, str]],
+                source_locale: str,
+                target_locale: str,
+                cancel: object = None,
+            ) -> dict[str, str]:
+                del api_key, model, source_locale, target_locale, cancel
+                self.calls.append(items)
+                translations = {
+                    "unit-1": "これは機械工学の頂点へ至る最後の段階の一つです。",
+                    "unit-1::styled::0000": "高ティア機械技術",
+                }
+                return {item["id"]: translations[item["id"]] for item in items}
+
+        source = (
+            "They represent one of the final steps before reaching the pinnacle "
+            "of machine engineering. &7High-Tier Machine Technology"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = _project(source, root)
+            client = TerminalStyleClient()
+            adapter = RecordingAdapter()
+
+            outcome = TranslationService(client).translate(
+                project,
+                adapter,
+                project.default_output,
+                "sk-test",
+                "gpt-test",
+                GlossaryCatalog(),
+                TranslationOptions(),
+            )
+
+        self.assertEqual(len(client.calls), 1, "末尾装飾は個別再試行しない")
+        items = {item["id"]: item for item in client.calls[0]}
+        self.assertEqual(set(items), {"unit-1", "unit-1::styled::0000"})
+        self.assertEqual(
+            items["unit-1"]["text"],
+            "They represent one of the final steps before reaching the pinnacle "
+            "of machine engineering. ",
+        )
+        self.assertNotIn("styled_bindings", items["unit-1"])
+        self.assertNotRegex(items["unit-1"]["text"], _PROTECTED_TOKEN)
+        self.assertEqual(
+            items["unit-1::styled::0000"]["text"],
+            "High-Tier Machine Technology",
+        )
+        self.assertEqual(
+            adapter.calls[0][1]["unit-1"],
+            "これは機械工学の頂点へ至る最後の段階の一つです。"
+            "&7高ティア機械技術",
+        )
+        self.assertEqual((outcome.translated, outcome.reused), (1, 0))
+
     def test_complex_unclosed_formatting_stays_provider_visible_and_strict(self) -> None:
         cases = (
-            ("Text &aThing", 1, "訳:Text &aThing"),
+            (
+                "Text &aStyled &bSwitched",
+                2,
+                "訳:Text &aStyled &bSwitched",
+            ),
             ("&aFirst &bSecond&r", 3, "&a訳:First &bSecond&r"),
             ("&aLine 1\nLine 2", 2, "&a訳:Line 1\nLine 2"),
         )

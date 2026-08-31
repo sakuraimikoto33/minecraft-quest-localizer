@@ -71,6 +71,7 @@ _TRANSPORT_CANCEL_POLL_SECONDS = 0.1
 _MAX_API_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_STRUCTURED_OUTPUT_PROPERTIES = 5000
 _MAX_STRUCTURED_OUTPUT_SCHEMA_CHARS = 110_000
+_MAX_STRUCTURED_OUTPUT_ENUM_VALUES = 1000
 _API_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
 _BEARER_PATTERN = re.compile(r"(?i)Bearer\s+[^\s,;]+")
 _O_SERIES_MODEL_PATTERN = re.compile(r"^o\d+(?:$|[-.])")
@@ -497,9 +498,36 @@ def _prepare_structured_translation_items(
 def _structured_translation_schema(
     items: tuple[_StructuredTranslationItem, ...],
 ) -> dict[str, Any]:
+    # Structured Outputs counts every enum member in the schema.  Reuse one
+    # definition per distinct token count, prefer the cheapest small counts,
+    # and retain the local integer/permutation validator for budget fallbacks.
+    position_definition_by_count: dict[int, str] = {}
+    position_definitions: dict[str, Any] = {}
+    remaining_enum_values = _MAX_STRUCTURED_OUTPUT_ENUM_VALUES
+    for token_count in sorted(
+        {len(item.token_keys) for item in items if item.token_keys}
+    ):
+        if token_count > remaining_enum_values:
+            break
+        definition_name = f"token_position_{token_count:04d}"
+        position_definition_by_count[token_count] = definition_name
+        position_definitions[definition_name] = {
+            "type": "integer",
+            "enum": list(range(token_count)),
+        }
+        remaining_enum_values -= token_count
+
     translation_properties: dict[str, Any] = {}
     response_keys: list[str] = []
     for item in items:
+        position_definition = position_definition_by_count.get(
+            len(item.token_keys)
+        )
+        position_schema = (
+            {"$ref": f"#/$defs/{position_definition}"}
+            if position_definition is not None
+            else {"type": "integer"}
+        )
         response_keys.append(item.response_key)
         translation_properties[item.response_key] = {
             "type": "object",
@@ -515,7 +543,7 @@ def _structured_translation_schema(
                 "token_positions": {
                     "type": "object",
                     "properties": {
-                        key: {"type": "integer"} for key in item.token_keys
+                        key: dict(position_schema) for key in item.token_keys
                     },
                     "required": list(item.token_keys),
                     "additionalProperties": False,
@@ -524,7 +552,7 @@ def _structured_translation_schema(
             "required": ["fragments", "token_positions"],
             "additionalProperties": False,
         }
-    return {
+    schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "translations": {
@@ -537,6 +565,9 @@ def _structured_translation_schema(
         "required": ["translations"],
         "additionalProperties": False,
     }
+    if position_definitions:
+        schema["$defs"] = position_definitions
+    return schema
 
 
 def _schema_property_count(schema: object) -> int:

@@ -27,6 +27,10 @@ from .scan_limits import GlossaryScanLimits
 
 
 _LANG_PATH = re.compile(r"^assets/([^/]+)/lang/([^/]+)\.(json|lang)$", re.IGNORECASE)
+_CODEX_CHAPTER_KEY = re.compile(
+    r"^(?P<namespace>[a-z0-9_.-]+)\.codex\.chapter\."
+    r"(?P<path>[a-z0-9_.-]+)$"
+)
 _FORMAT_CODE_PATTERN = re.compile(
     r"§x(?:§[0-9A-Fa-f]){6}|&x(?:&[0-9A-Fa-f]){6}"
     r"|[§&]#[0-9A-Fa-f]{6}|[§&][0-9A-FK-ORZa-fk-orz]",
@@ -161,6 +165,10 @@ _MAX_ARCHIVE_MEMBERS = 100_000
 _MAX_LANGUAGE_ENTRIES_PER_MEMBER = 250_000
 _MAX_EXTERNAL_ZIP_CENTRAL_DIRECTORY_BYTES = _MAX_ARCHIVE_MEMBERS * 46
 _MAX_LANGUAGE_COMPRESSED_MEMBER_BYTES = 16 * 1024 * 1024
+_UNEXPANDED_METADATA_TEMPLATE = re.compile(
+    r"\$\{[A-Za-z_][A-Za-z0-9_.-]*\}"
+)
+_METADATA_TEMPLATE_SENTINEL = "mq_template_value"
 _DEFAULT_SCAN_LIMITS = GlossaryScanLimits()
 _PRIMARY_METADATA_READERS: tuple[
     tuple[str, Callable[[bytes, str], list[tuple[str, str]]]], ...
@@ -215,6 +223,12 @@ _REGISTRY_TERM_KEY_PREFIXES = (
     "instrument.",
     "jukebox_song.",
 )
+_MATERIAL_FAMILY_FORMS: dict[str, str] = {
+    "ingot": "item",
+    "nugget": "item",
+    "block": "block",
+}
+_MATERIAL_BASE_ALIAS_KEY_PREFIX = "mq_localizer.material_base."
 _DESCRIPTIVE_TERM_KEY_SEGMENTS = frozenset(
     {
         "desc",
@@ -883,7 +897,8 @@ class GlossaryCatalog:
         """Return occurrence-specific replacements without string-key collisions."""
 
         replacements: list[list[TermReplacement]] = [[] for _part in parts]
-        for match in self._matches(parts):
+        for match_index, match in enumerate(self._matches(parts)):
+            group_id = match_index if len(match.fragment_ranges) > 1 else None
             for fragment_index, (part_index, start, end) in enumerate(
                 match.fragment_ranges
             ):
@@ -893,7 +908,7 @@ class GlossaryCatalog:
                     else match.fragments[fragment_index][1]
                 )
                 replacements[part_index].append(
-                    TermReplacement(start, end, replacement)
+                    TermReplacement(start, end, replacement, group_id)
                 )
         for part_replacements in replacements:
             part_replacements.sort(key=lambda item: (item.start, item.end))
@@ -918,15 +933,32 @@ class GlossaryCatalog:
         for match in matches:
             expected = _expected_match_value(match)
             expected_by_match.append(expected)
-            if expected in expected_entries:
+            existing_expected = expected_entries.get(expected)
+            is_project_reference = _is_project_reference(match.entry)
+            if existing_expected is not None and (
+                not is_project_reference
+                or _is_project_reference(existing_expected)
+            ):
                 continue
             expected_entries[expected] = GlossaryEntry(
                 source=expected,
                 target=expected,
-                key=f"mq_localizer.layout_expected.{len(expected_entries)}",
-                mod_id="mq_localizer",
+                key=(
+                    f"{_PROJECT_REFERENCE_KEY_PREFIX}layout_{len(expected_entries)}"
+                    if is_project_reference
+                    else f"mq_localizer.layout_expected.{len(expected_entries)}"
+                ),
+                mod_id=(
+                    "mq_project_reference_layout"
+                    if is_project_reference
+                    else "mq_localizer"
+                ),
                 translated=False,
                 provenance="existing translation layout validation",
+                target_state=(
+                    "explicit_source" if is_project_reference else "missing"
+                ),
+                source_tier=("project" if is_project_reference else "mod"),
             )
         marker_by_expected = {
             expected: f"MQTERM{index:04X}"
@@ -934,8 +966,11 @@ class GlossaryCatalog:
         }
 
         source_spans: list[TermReplacement] = []
-        for match, expected in zip(matches, expected_by_match, strict=True):
+        for match_index, (match, expected) in enumerate(
+            zip(matches, expected_by_match, strict=True)
+        ):
             marker = marker_by_expected[expected]
+            group_id = match_index if len(match.fragment_ranges) > 1 else None
             for fragment_index, (_part, start, end) in enumerate(
                 match.fragment_ranges
             ):
@@ -944,6 +979,7 @@ class GlossaryCatalog:
                         start,
                         end,
                         f"{marker}F{fragment_index:04X}",
+                        group_id,
                     )
                 )
 
@@ -952,8 +988,9 @@ class GlossaryCatalog:
             entries=expected_entries,
             _contextual_filtering=False,
         )
-        for match in expected_catalog._matches([candidate]):
+        for match_index, match in enumerate(expected_catalog._matches([candidate])):
             marker = marker_by_expected[match.visible]
+            group_id = match_index if len(match.fragment_ranges) > 1 else None
             for fragment_index, (_part, start, end) in enumerate(
                 match.fragment_ranges
             ):
@@ -962,6 +999,7 @@ class GlossaryCatalog:
                         start,
                         end,
                         f"{marker}F{fragment_index:04X}",
+                        group_id,
                     )
                 )
         source_spans.sort(key=lambda item: (item.start, item.end))
@@ -1192,7 +1230,7 @@ class GlossaryCatalog:
     def _ensure_match_index(self) -> None:
         if self._match_index_ready:
             return
-        self._match_entries = _entries_with_regular_plural_aliases(self.entries)
+        self._match_entries = _entries_with_matcher_aliases(self.entries)
         word_mod_ids: dict[str, set[str]] = {}
         if self.evidence:
             evidence = [
@@ -1551,7 +1589,9 @@ def _canonical_ascii_word(value: str) -> str:
 
 def _is_generic_group_entry(entry: GlossaryEntry) -> bool:
     folded_key = entry.key.casefold()
-    return folded_key.startswith(("tag.", "key.categories."))
+    return folded_key.startswith(("tag.", "key.categories.")) or bool(
+        _CODEX_CHAPTER_KEY.fullmatch(folded_key)
+    )
 
 
 def _entry_key_identifies_label(entry: GlossaryEntry) -> bool:
@@ -1628,7 +1668,9 @@ def _term_is_contextually_weak(
     canonical_words = tuple(_canonical_ascii_word(word) for word in words)
     if _is_mod_display_name(entry) or _is_project_reference(entry):
         return len(words) == 1 and _is_ordinary_shaped_ascii_word(entry.source)
-    if _is_generic_group_entry(entry):
+    if _is_generic_group_entry(entry) or entry.key.startswith(
+        _MATERIAL_BASE_ALIAS_KEY_PREFIX
+    ):
         return True
     if len(words) == 1:
         return (
@@ -2021,11 +2063,183 @@ def _entries_with_regular_plural_aliases(
                     target_state="rejected",
                 )
             continue
-        # A missing target on an exact plural tag is not an instruction to
-        # preserve English.  Use the unique translated singular registry name.
+        # A missing exact plural can borrow a unique singular translation only
+        # from the same provider. Cross-provider tag labels are the deliberate
+        # exception because they name shared registry groups. Other official
+        # headings must not be replaced by an unrelated Mod's same-spelled
+        # singular (Eidolon ``Soul Gems`` versus Occultism ``Soul Gem``).
         if exact.target_state == "missing":
-            result[alias] = derived
+            if not derived.translated:
+                continue
+            exact_mod_id = exact.mod_id.casefold()
+            same_provider = any(
+                candidate.translated
+                and candidate.mod_id.casefold() == exact_mod_id
+                for candidate in candidates
+            )
+            generic_tag = exact.key.casefold().startswith(
+                ("tag.item.", "tag.block.", "tag.fluid.", "tag.entity_type.")
+            )
+            if same_provider or generic_tag:
+                result[alias] = min(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if generic_tag
+                        or candidate.mod_id.casefold() == exact_mod_id
+                    ),
+                    key=_glossary_evidence_sort_key,
+                )
     return result
+
+
+def _entries_with_matcher_aliases(
+    entries: dict[str, GlossaryEntry],
+) -> dict[str, GlossaryEntry]:
+    """Build private aliases without changing exact glossary evidence.
+
+    Regular plurals retain their existing behavior. Material-family bases are
+    then derived only from the original exact entries, so a derived base such
+    as ``Arcane Gold`` cannot itself produce the unsafe plural ``Arcane
+    Golds``.
+    """
+
+    result = _entries_with_regular_plural_aliases(entries)
+    for source, alias in _material_family_base_aliases(entries).items():
+        if source not in entries:
+            # Exact evidence wins, but a complete material family is stronger
+            # than an unrelated singular's guessed plural alias.
+            result[source] = alias
+    return result
+
+
+def _material_family_base_aliases(
+    entries: dict[str, GlossaryEntry],
+) -> dict[str, GlossaryEntry]:
+    """Derive a source-preserving base from a complete material family.
+
+    Some Mods register only names such as ``Arcane Gold Ingot``, ``Arcane
+    Gold Nugget``, and ``Arcane Gold Block`` even though quest prose refers to
+    the material as ``Arcane Gold``. A shared string prefix alone is not enough
+    evidence: it would also turn ordinary words such as ``Iron`` into global
+    protected terms. Require all three registry forms, an identical provider,
+    and an exact correspondence between the display-name base and the
+    registry-key stem. Resolved entries may legitimately have different source
+    tiers when only some target values came from a lower-priority fallback. The
+    alias is matcher-only and source-preserving because no official translation
+    for the standalone base exists.
+    """
+
+    family_forms: dict[
+        tuple[str, str, tuple[str, ...]],
+        dict[str, list[tuple[str, GlossaryEntry]]],
+    ] = {}
+    for entry in entries.values():
+        parsed = _material_family_member(entry)
+        if parsed is None:
+            continue
+        namespace, key_stem, form, base = parsed
+        family = (
+            entry.mod_id.casefold(),
+            namespace,
+            key_stem,
+        )
+        family_forms.setdefault(family, {}).setdefault(form, []).append(
+            (base, entry)
+        )
+
+    candidates_by_base: dict[str, list[tuple[GlossaryEntry, ...]]] = {}
+    required_forms = frozenset(_MATERIAL_FAMILY_FORMS)
+    for forms in family_forms.values():
+        if frozenset(forms) != required_forms or any(
+            len(candidates) != 1 for candidates in forms.values()
+        ):
+            continue
+        ordered = tuple(forms[form][0] for form in _MATERIAL_FAMILY_FORMS)
+        bases = {base for base, _entry in ordered}
+        if len(bases) != 1:
+            continue
+        base = next(iter(bases))
+        candidates_by_base.setdefault(base, []).append(
+            tuple(entry for _base, entry in ordered)
+        )
+
+    aliases: dict[str, GlossaryEntry] = {}
+    for base, families in candidates_by_base.items():
+        # Exact evidence always wins. Multiple independent families sharing a
+        # spelling are ambiguous provenance, even though both would currently
+        # preserve the same English text, so fail closed instead of guessing.
+        if base in entries or len(families) != 1:
+            continue
+        family = families[0]
+        representative = min(family, key=_glossary_evidence_sort_key)
+        aliases[base] = GlossaryEntry(
+            source=base,
+            target=base,
+            key=(
+                f"{_MATERIAL_BASE_ALIAS_KEY_PREFIX}"
+                f"{representative.mod_id.casefold()}."
+                f"{'_'.join(base.casefold().split())}"
+            ),
+            mod_id=representative.mod_id,
+            translated=False,
+            provenance=(
+                f"{representative.provenance} "
+                "[共通素材名: Ingot / Nugget / Block]"
+            ),
+            target_state="missing",
+            source_tier=representative.source_tier,
+        )
+    return aliases
+
+
+def _material_family_member(
+    entry: GlossaryEntry,
+) -> tuple[str, tuple[str, ...], str, str] | None:
+    """Return a registry-backed material-family member when fully proven."""
+
+    if (
+        entry.target_state == "rejected"
+        or entry.source_had_printf
+        or not entry.mod_id.strip()
+        or not entry.source.isascii()
+        or protected_syntax_signature(entry.source)
+    ):
+        return None
+    words = re.fullmatch(
+        r"(?P<base>[A-Za-z0-9]+(?: [A-Za-z0-9]+)+) "
+        r"(?P<form>Ingot|Nugget|Block)",
+        entry.source,
+        re.IGNORECASE,
+    )
+    if words is None:
+        return None
+    base = words.group("base")
+    base_words = tuple(base.split())
+    if len(base_words) < 2 or any(
+        word[0].isalpha() and not word[0].isupper() for word in base_words
+    ):
+        return None
+    form = words.group("form").casefold()
+    expected_registry = _MATERIAL_FAMILY_FORMS[form]
+    normalized_key = entry.key.casefold()
+    key_prefix = f"{expected_registry}."
+    if not normalized_key.startswith(key_prefix):
+        return None
+    namespace, separator, resource_path = normalized_key[
+        len(key_prefix) :
+    ].partition(".")
+    if not separator or not namespace or not resource_path:
+        return None
+    key_tokens = tuple(
+        token for token in _TERM_KEY_TOKEN_SPLIT.split(resource_path) if token
+    )
+    if len(key_tokens) < 3 or key_tokens[-1] != form:
+        return None
+    key_stem = key_tokens[:-1]
+    if key_stem != tuple(word.casefold() for word in base_words):
+        return None
+    return namespace, key_stem, form, base
 
 
 def _regular_plural_alias(entry: GlossaryEntry) -> str | None:
@@ -2049,7 +2263,13 @@ def _regular_plural_alias(entry: GlossaryEntry) -> str | None:
         # Single words are too likely to be verbs or ordinary prose.  Exact
         # whole-value handling can be added later with stronger context.
         return None
-    match = re.search(r"(?P<word>[A-Za-z]+)\Z", entry.source)
+    return _regular_plural_label(entry.source)
+
+
+def _regular_plural_label(source: str) -> str | None:
+    """Return the existing conservative English plural for one label."""
+
+    match = re.search(r"(?P<word>[A-Za-z]+)\Z", source)
     if match is None:
         return None
     word = match.group("word")
@@ -2064,7 +2284,7 @@ def _regular_plural_alias(entry: GlossaryEntry) -> str | None:
         plural_word = word + ("ES" if word.isupper() else "es")
     else:
         plural_word = word + ("S" if word.isupper() else "s")
-    return entry.source[: match.start()] + plural_word
+    return source[: match.start()] + plural_word
 
 
 def _parse_resource_id(value: str) -> tuple[str, str] | None:
@@ -3188,6 +3408,12 @@ def _language_pair_entries(
             key.casefold(): _strip_display_formatting(value).strip()
             for key, value in source_values.items()
         }
+        proven_terminology_keys = resource_backed_term_keys.union(
+            _registry_backed_codex_chapter_keys(
+                source_labels,
+                resource_backed_term_keys,
+            )
+        )
         _raise_if_cancelled(cancel)
         target_language: _ParsedLanguage | None = None
         target_read_failed = False
@@ -3213,7 +3439,7 @@ def _language_pair_entries(
                 raw_source,
                 source_keys,
                 source_labels,
-                resource_backed_term_keys,
+                proven_terminology_keys,
             )
             if source_label is None:
                 continue
@@ -3521,6 +3747,7 @@ def _read_mod_display_names(
     warnings: list[str] = []
     seen: set[tuple[str, str]] = set()
     manifest_declares_library = False
+    neoforge_metadata_resolved = False
 
     # FMLModType belongs to the manifest main section and describes how Forge
     # must load the whole archive. In particular, LIBRARY/GAMELIBRARY and
@@ -3547,14 +3774,28 @@ def _read_mod_display_names(
         archive_name = archive_names.get(expected_path.casefold())
         if archive_name is None:
             continue
+        member_data: bytes | None = None
         try:
-            values = reader(_read_small_archive_member(archive, archive_name), source_locale)
+            member_data = _read_small_archive_member(archive, archive_name)
+            values = reader(member_data, source_locale)
         except (OSError, UnicodeError, zipfile.BadZipFile, RuntimeError, ValueError) as exc:
+            if (
+                expected_path == "META-INF/mods.toml"
+                and neoforge_metadata_resolved
+                and member_data is not None
+                and _is_inactive_forge_metadata_template(member_data)
+            ):
+                # NeoForge prefers neoforge.mods.toml. Some released JARs keep
+                # an unexpanded Forge build template beside the concrete
+                # NeoForge metadata; that inactive alternative does not mean
+                # display-name protection is partial.
+                continue
             warnings.append(
                 f"{jar_name}!/{archive_name}: Modメタデータを読めませんでした ({exc})。"
                 "このmetadataからはMod表示名を保護対象に追加していません"
             )
             continue
+        resolved_from_member = False
         for mod_id, display_name in values:
             _raise_if_cancelled(cancel)
             normalized_name = _normalize_mod_display_name(display_name)
@@ -3565,11 +3806,14 @@ def _read_mod_display_names(
                         f"({_short_value(display_name)!r})"
                     )
                 continue
+            resolved_from_member = True
             identity = (mod_id.strip(), normalized_name)
             if identity in seen:
                 continue
             seen.add(identity)
             entries.append(_mod_display_name_entry(normalized_name, mod_id, jar_name, archive_name))
+        if expected_path == "META-INF/neoforge.mods.toml" and resolved_from_member:
+            neoforge_metadata_resolved = True
 
     # Older and loader-agnostic JARs sometimes expose only a conventional title
     # in MANIFEST.MF. Treat it as a fallback to avoid overriding explicit loader data.
@@ -3671,6 +3915,39 @@ def _read_limited_archive_member(
     if len(data) > max_bytes:
         raise ValueError(f"{label}の実読込サイズが上限を超えています ({len(data)} > {max_bytes} bytes)")
     return data
+
+
+def _is_inactive_forge_metadata_template(data: bytes) -> bool:
+    """Recognize an otherwise-valid, entirely unexpanded Forge template."""
+
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeError:
+        return False
+    if _UNEXPANDED_METADATA_TEMPLATE.search(text) is None:
+        return False
+    substituted = _UNEXPANDED_METADATA_TEMPLATE.sub(
+        _METADATA_TEMPLATE_SENTINEL,
+        text,
+    )
+    try:
+        loaded = tomllib.loads(substituted)
+    except (UnicodeError, ValueError):
+        # A placeholder in a comment or string must not conceal an unrelated
+        # TOML error.
+        return False
+    mods = loaded.get("mods", [])
+    if not isinstance(mods, list) or not mods:
+        return False
+    for mod in mods:
+        if not isinstance(mod, dict):
+            return False
+        if mod.get("modId") != _METADATA_TEMPLATE_SENTINEL:
+            return False
+        display_name = mod.get("displayName")
+        if display_name not in (None, _METADATA_TEMPLATE_SENTINEL):
+            return False
+    return True
 
 
 def _read_forge_metadata(data: bytes) -> list[tuple[str, str]]:
@@ -5181,7 +5458,10 @@ def _collect_target_only_language_evidence(
                 _raise_if_cancelled(cancel)
             if (
                 key.casefold() in source_keys
-                or not key.casefold().startswith(_TERM_KEY_PREFIXES)
+                or not (
+                    key.casefold().startswith(_TERM_KEY_PREFIXES)
+                    or _CODEX_CHAPTER_KEY.fullmatch(key.casefold()) is not None
+                )
             ):
                 continue
             target_only.append(
@@ -5453,22 +5733,112 @@ def _resource_backed_terminology_keys(archive_names: dict[str, str]) -> frozense
     return frozenset(result)
 
 
+def _registry_backed_codex_chapter_keys(
+    source_labels: dict[str, str],
+    resource_backed_keys: frozenset[str],
+) -> frozenset[str]:
+    """Return short Codex labels corroborated by a registry-name suffix.
+
+    Eidolon names the registered item ``Lesser Soul Gem`` while its Codex and
+    quest prose use the family name ``Soul Gems``. Accepting every Codex
+    chapter would turn ordinary headings into global terminology, and dropping
+    an arbitrary leading word from every item name would be equally unsafe.
+    This bridge therefore requires both pieces of independent evidence in the
+    same namespace, exact display-name/resource-key token correspondence, a
+    suffix of at least two words, and either that suffix or its conservative
+    regular plural as the complete chapter label and key path.
+    """
+
+    aliases_by_namespace: dict[str, set[str]] = {}
+    for key in resource_backed_keys:
+        normalized_key = key.casefold()
+        prefix = next(
+            (
+                candidate
+                for candidate in ("item.", "block.")
+                if normalized_key.startswith(candidate)
+            ),
+            "",
+        )
+        if not prefix:
+            continue
+        namespace, separator, resource_path = normalized_key[
+            len(prefix) :
+        ].partition(".")
+        if not separator or not namespace or not resource_path:
+            continue
+        label = " ".join(source_labels.get(normalized_key, "").split())
+        label_words = _simple_ascii_title_words(label)
+        key_tokens = tuple(
+            token for token in _TERM_KEY_TOKEN_SPLIT.split(resource_path) if token
+        )
+        if (
+            label_words is None
+            or len(label_words) < 3
+            or key_tokens != tuple(word.casefold() for word in label_words)
+        ):
+            continue
+        aliases = aliases_by_namespace.setdefault(namespace, set())
+        for width in range(2, len(label_words)):
+            singular = " ".join(label_words[-width:])
+            aliases.add(singular)
+            plural = _regular_plural_label(singular)
+            if plural is not None:
+                aliases.add(plural)
+
+    result: set[str] = set()
+    for key, raw_label in source_labels.items():
+        match = _CODEX_CHAPTER_KEY.fullmatch(key)
+        if match is None:
+            continue
+        label = " ".join(raw_label.split())
+        label_words = _simple_ascii_title_words(label)
+        if label_words is None or len(label_words) < 2:
+            continue
+        path_tokens = tuple(
+            token
+            for token in _TERM_KEY_TOKEN_SPLIT.split(match.group("path"))
+            if token
+        )
+        if path_tokens != tuple(word.casefold() for word in label_words):
+            continue
+        if label in aliases_by_namespace.get(match.group("namespace"), set()):
+            result.add(key)
+    return frozenset(result)
+
+
+def _simple_ascii_title_words(value: str) -> tuple[str, ...] | None:
+    """Return simple title-shaped words used only for corroborated aliases."""
+
+    if (
+        not value
+        or not value.isascii()
+        or not _looks_like_short_term_label(value)
+        or re.fullmatch(r"[A-Za-z0-9]+(?: [A-Za-z0-9]+)+", value) is None
+    ):
+        return None
+    words = tuple(value.split())
+    if any(word[0].isalpha() and not word[0].isupper() for word in words):
+        return None
+    return words
+
+
 def _is_terminology_key(
     key: str,
     available_keys: frozenset[str],
     source_labels: dict[str, str],
     resource_backed_keys: frozenset[str],
 ) -> bool:
-    """Accept registry labels while rejecting descriptions and child UI labels."""
+    """Accept proven labels while rejecting descriptions and child UI labels."""
 
     normalized = key.casefold()
-    if not normalized.startswith(_TERM_KEY_PREFIXES):
-        return False
-
-    # A matching item model or blockstate is stronger evidence than a suffix:
-    # dots are legal in real registry paths, including names such as ``manual.desc``.
+    # A matching resource or a separately corroborated short label is stronger
+    # evidence than its language-key prefix. Dots are legal in real registry
+    # paths, including names such as ``manual.desc``.
     if normalized in resource_backed_keys:
         return True
+    if not normalized.startswith(_TERM_KEY_PREFIXES):
+        return False
 
     # Description/tooltip/lore keys are prose even when a companion base key
     # is absent. Split underscores and numeric suffixes as used by many Mods.

@@ -79,35 +79,39 @@ class _StyledBodyProjection:
 class _ProjectionCandidate:
     start: int
     end: int
-    term_token: str = ""
+    term_tokens: tuple[str, ...] = ()
     fixed_expansion: str = ""
     body_source: str = ""
     opening: str = ""
     reset: str = ""
+    local_suffix: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class _ProviderProjection:
     """Provider-facing text plus exact local-only token expansions.
 
-    A closed formatting span whose entire body is one protected term is one
-    semantic unit for translation.  Exposing its opening code, term, and reset
-    as independent opaque tokens lets a model put a Japanese particle inside
-    the formatting range even though it cannot know which token is the reset.
-    Such spans are therefore projected to one otherwise-unused MQP token and
-    expanded locally before the existing fail-closed restoration checks run.
+    A closed formatting span whose entire body is one protected term, or one
+    logical term split by formatting/escaped-ampersand syntax, is one semantic
+    unit for translation. Exposing its pieces as independent opaque tokens
+    lets a model separate the term or put a Japanese particle inside its
+    formatting range. Such spans are therefore projected to one otherwise-
+    unused MQP token and expanded locally before the existing fail-closed
+    restoration checks run.
 
-    A consecutive, non-reset formatting stack at the absolute start of an
-    otherwise simple unclosed span (for example ``&aTitle``) is also kept
-    local.  It applies to the complete provider-visible body, so exposing it as
-    a movable token can only create invalid candidates; ``fixed_prefix`` puts
-    the exact protected formatting placeholders back before restoration.
+    Consecutive non-reset formatting stacks at either safe edge are also kept
+    local.  An absolute leading stack is restored through ``fixed_prefix``.
+    A simple terminal styled suffix is translated as a separate child and
+    appended through ``local_suffix_bodies``.  The latter is deliberately not
+    represented by a movable provider token: moving an unclosed suffix before
+    its preceding prose would make its formatting bleed into that prose.
     """
 
     text: str
     term_token_aliases: tuple[tuple[str, str], ...] = ()
     expansions: tuple[tuple[str, str], ...] = ()
     styled_bodies: tuple[_StyledBodyProjection, ...] = ()
+    local_suffix_bodies: tuple[_StyledBodyProjection, ...] = ()
     fixed_prefix: str = ""
 
     def provider_token_for(self, original_token: str) -> str:
@@ -124,7 +128,10 @@ class _ProviderProjection:
         observed_tokens = Counter(_MQP_PLACEHOLDER.findall(translated))
         expected_tokens = Counter(_MQP_PLACEHOLDER.findall(self.text))
         if (
-            self.expansions or self.styled_bodies or self.fixed_prefix
+            self.expansions
+            or self.styled_bodies
+            or self.local_suffix_bodies
+            or self.fixed_prefix
         ) and observed_tokens != expected_tokens:
             missing = sorted((expected_tokens - observed_tokens).elements())
             extra = sorted((observed_tokens - expected_tokens).elements())
@@ -151,6 +158,14 @@ class _ProviderProjection:
             )
         if self.fixed_prefix:
             translated = self.fixed_prefix + translated
+        for styled in self.local_suffix_bodies:
+            if styled.part_id not in translated_parts:
+                raise TranslationError(
+                    "内部エラー: 末尾装飾本文の翻訳結果を親の文章へ対応付けられません"
+                )
+            translated += (
+                styled.opening + translated_parts[styled.part_id] + styled.reset
+            )
         return translated
 
 
@@ -158,8 +173,9 @@ def _safe_fixed_leading_format_prefix(protected: ProtectedText) -> str:
     """Return a locally fixed prefix for one simple unclosed style span.
 
     Only an absolute leading stack with no reset, later style switch, or fixed
-    layout boundary is eligible.  Mid-string codes and formatting that crosses
-    newlines/tabs retain the strict provider-response validation path.
+    layout boundary is eligible here.  Other mid-string codes and formatting
+    that crosses newlines/tabs retain the strict provider-response path; the
+    separate terminal-suffix helper handles its own narrower safe case.
     """
 
     if protected.structural_placeholders or len(protected.formatting_segments) != 1:
@@ -189,6 +205,84 @@ def _safe_fixed_leading_format_prefix(protected: ProtectedText) -> str:
     if cursor >= len(protected.protected):
         return ""
     return protected.protected[:cursor]
+
+
+def _terminal_unclosed_styled_body_candidate(
+    protected: ProtectedText,
+) -> _ProjectionCandidate | None:
+    """Return one simple terminal unclosed style as a local-only suffix.
+
+    Only one consecutive non-reset formatting stack followed by unprotected
+    ordinary text is eligible.  Newline/tab boundaries, later style switches,
+    terminology, and technical placeholders retain the strict provider path.
+    Keeping the suffix out of the parent provider item prevents a model from
+    moving preceding prose into the unclosed formatting scope.
+    """
+
+    if protected.structural_placeholders or len(protected.formatting_segments) != 1:
+        return None
+    formatting = protected.formatting_segments[0]
+    tokens = formatting.source_sequence
+    if (
+        not tokens
+        or formatting.movable_groups
+        or not formatting.strict_segment_signatures
+        or not formatting.strict_segment_signatures[0][0]
+        or not formatting.strict_segment_signatures[-1][0]
+    ):
+        return None
+
+    source = protected.protected
+    start = source.find(tokens[0])
+    if start <= 0:
+        return None
+    cursor = start
+    for token in tokens:
+        value = protected.replacements.get(token, "")
+        if (
+            (
+                len(value) == 2
+                and value[0] in {"&", "§"}
+                and value[1].lower() == "r"
+            )
+            or not source.startswith(token, cursor)
+        ):
+            return None
+        cursor += len(token)
+
+    body = source[cursor:]
+    if (
+        not any(character.isalnum() for character in body)
+        or _MQP_PLACEHOLDER.search(body)
+    ):
+        return None
+    opening = source[start:cursor]
+    if (
+        tuple(_MQP_PLACEHOLDER.findall(opening)) != tokens
+        or _MQP_PLACEHOLDER.sub("", opening)
+    ):
+        return None
+
+    special_spans = dict(
+        zip(
+            protected.special_placeholders,
+            protected.special_source_spans,
+            strict=True,
+        )
+    )
+    last_span = special_spans.get(tokens[-1])
+    if last_span is None:
+        raise TranslationError("内部エラー: 末尾装飾本文の原文位置を特定できません")
+    original_body = protected.original[last_span[1] :]
+    if original_body != body:
+        return None
+    return _ProjectionCandidate(
+        start=start,
+        end=len(source),
+        body_source=original_body,
+        opening=opening,
+        local_suffix=True,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,6 +816,183 @@ def _make_batches(
     return batches
 
 
+def _grouped_term_projection_candidates(
+    protected: ProtectedText,
+) -> list[_ProjectionCandidate]:
+    r"""Collapse fragments of one glossary match into one provider token.
+
+    Formatting codes and the literal ``\&`` escape can split a single visible
+    project or registry name into several occurrence spans. The local
+    protector still tracks every span independently for provenance checks, but
+    the provider must see the complete name as one semantic unit so it cannot
+    separate those fragments while reordering a sentence.
+    """
+
+    if not (
+        len(protected.term_placeholders)
+        == len(protected.term_source_spans)
+        == len(protected.term_group_ids)
+    ):
+        raise TranslationError("内部エラー: 固有名詞groupを再検証できません")
+
+    terms_by_group: dict[int, list[str]] = {}
+    for placeholder, group_id in zip(
+        protected.term_placeholders,
+        protected.term_group_ids,
+        strict=True,
+    ):
+        if group_id is not None:
+            terms_by_group.setdefault(group_id, []).append(placeholder)
+
+    source = protected.protected
+    all_terms = frozenset(protected.term_placeholders)
+    formatting_tokens = frozenset(
+        placeholder
+        for segment in protected.formatting_segments
+        for placeholder in segment.source_sequence
+    )
+    eligible_specials = formatting_tokens | frozenset(
+        placeholder
+        for placeholder in protected.special_placeholders
+        if protected.replacements.get(placeholder) == r"\&"
+    )
+    formatting_positions: dict[str, int] = {}
+    formatting_at_start: dict[int, str] = {}
+    formatting_at_end: dict[int, str] = {}
+    for placeholder in formatting_tokens:
+        position = source.find(placeholder)
+        if position < 0 or source.find(placeholder, position + len(placeholder)) >= 0:
+            raise TranslationError("内部エラー: 装飾tokenの位置を特定できません")
+        formatting_positions[placeholder] = position
+        formatting_at_start[position] = placeholder
+        formatting_at_end[position + len(placeholder)] = placeholder
+    strict_formatting_tokens: set[str] = set()
+    formatting_group_ranges: list[tuple[int, int]] = []
+    for segment in protected.formatting_segments:
+        if segment.strict_segment_signatures:
+            strict_formatting_tokens.update(segment.source_sequence)
+        for formatting_group in segment.movable_groups:
+            group_start = formatting_positions[formatting_group.placeholders[0]]
+            group_end = (
+                formatting_positions[formatting_group.placeholders[-1]]
+                + len(formatting_group.placeholders[-1])
+            )
+            formatting_group_ranges.append((group_start, group_end))
+    strict_layout_ranges: list[tuple[int, int]] = []
+    layout_ranges: list[tuple[int, int]] = []
+    layout_start = 0
+    for boundary in protected.structural_placeholders:
+        boundary_start = source.find(boundary, layout_start)
+        if boundary_start < layout_start:
+            raise TranslationError("内部エラー: 固定配置tokenの範囲を特定できません")
+        layout_ranges.append((layout_start, boundary_start))
+        layout_start = boundary_start + len(boundary)
+    layout_ranges.append((layout_start, len(source)))
+    if len(layout_ranges) != len(protected.formatting_segments):
+        raise TranslationError("内部エラー: 装飾と固定配置の範囲が一致しません")
+    strict_layout_ranges.extend(
+        layout_range
+        for layout_range, segment in zip(
+            layout_ranges,
+            protected.formatting_segments,
+            strict=True,
+        )
+        if segment.strict_segment_signatures
+    )
+
+    candidates: list[_ProjectionCandidate] = []
+    for term_tokens in terms_by_group.values():
+        if len(term_tokens) < 2:
+            continue
+        positions: list[int] = []
+        for placeholder in term_tokens:
+            position = source.find(placeholder)
+            if position < 0 or source.find(placeholder, position + len(placeholder)) >= 0:
+                raise TranslationError("内部エラー: 固有名詞groupの位置を特定できません")
+            positions.append(position)
+        if positions != sorted(positions):
+            raise TranslationError("内部エラー: 固有名詞groupの順序を特定できません")
+
+        start = positions[0]
+        end = positions[-1] + len(term_tokens[-1])
+
+        # Keep immediately adjacent opening style codes with the grouped name.
+        # A reset belongs to preceding prose and must never be pulled in.
+        while start in formatting_at_end:
+            placeholder = formatting_at_end[start]
+            value = protected.replacements[placeholder]
+            if len(value) == 2 and value[0] in {"&", "§"} and value[1].lower() == "r":
+                break
+            start -= len(placeholder)
+
+        # Likewise, include only trailing resets that close formatting used by
+        # the name; a following color/style code belongs to later prose.
+        while end in formatting_at_start:
+            placeholder = formatting_at_start[end]
+            value = protected.replacements[placeholder]
+            if not (
+                len(value) == 2
+                and value[0] in {"&", "§"}
+                and value[1].lower() == "r"
+            ):
+                break
+            end += len(placeholder)
+
+        original_group = source[start:end]
+        observed_tokens = tuple(_MQP_PLACEHOLDER.findall(original_group))
+        observed_terms = tuple(
+            placeholder for placeholder in observed_tokens if placeholder in all_terms
+        )
+        observed_formatting = tuple(
+            placeholder
+            for placeholder in observed_tokens
+            if placeholder in formatting_tokens
+        )
+        if (
+            observed_terms != tuple(term_tokens)
+            or any(
+                placeholder not in all_terms
+                and placeholder not in eligible_specials
+                for placeholder in observed_tokens
+            )
+            or _MQP_PLACEHOLDER.sub("", original_group)
+        ):
+            continue
+        if any(
+            placeholder in strict_formatting_tokens
+            for placeholder in observed_formatting
+        ) or any(
+            start < group_end
+            and end > group_start
+            and not (start <= group_start and end >= group_end)
+            for group_start, group_end in formatting_group_ranges
+        ) or any(
+            start < layout_end and end > layout_start
+            for layout_start, layout_end in strict_layout_ranges
+        ):
+            # A semantic atom may contain a whole closed formatting scope, but
+            # must not detach an opening code or reset from that scope.
+            continue
+        if observed_formatting and not any(
+            len(protected.replacements[placeholder]) == 2
+            and protected.replacements[placeholder][0] in {"&", "§"}
+            and protected.replacements[placeholder][1].lower() == "r"
+            for placeholder in observed_formatting
+        ):
+            # Moving an unclosed style with a term could change the scope of
+            # following prose. Leave that case to the strict validator.
+            continue
+        candidates.append(
+            _ProjectionCandidate(
+                start=start,
+                end=end,
+                term_tokens=tuple(term_tokens),
+                fixed_expansion=original_group,
+            )
+        )
+    return candidates
+
+
 def _build_provider_projection(
     protected: ProtectedText,
     part_id: str,
@@ -733,9 +1004,10 @@ def _build_provider_projection(
     by a child translation part; the translated child is inserted between the
     original opening codes and reset.  A simple unclosed style stack at the
     absolute beginning is removed from provider input and restored as an exact
-    local prefix.  Groups containing mixed terms, technical placeholders, or
-    other complex/unclosed formatting remain under the existing fail-closed
-    validator instead of being guessed at.
+    local prefix.  A simple unclosed suffix is translated independently and
+    appended locally so its boundary cannot move.  Groups containing mixed
+    terms, technical placeholders, or other complex/unclosed formatting remain
+    under the existing fail-closed validator instead of being guessed at.
     """
 
     source = protected.protected
@@ -755,7 +1027,10 @@ def _build_provider_projection(
             text=source[len(fixed_prefix) :],
             fixed_prefix=fixed_prefix,
         )
-    groups: list[_ProjectionCandidate] = []
+    groups = _grouped_term_projection_candidates(protected)
+    terminal_suffix = _terminal_unclosed_styled_body_candidate(protected)
+    if terminal_suffix is not None:
+        groups.append(terminal_suffix)
 
     for segment in protected.formatting_segments:
         for formatting_group in segment.movable_groups:
@@ -774,6 +1049,10 @@ def _build_provider_projection(
 
             start = positions[0]
             end = positions[-1] + len(formatting_tokens[-1])
+            if any(start < group.end and end > group.start for group in groups):
+                # A logical glossary term spanning this formatting group has
+                # already claimed the complete semantic range.
+                continue
             original_group = source[start:end]
             observed_tokens = tuple(_MQP_PLACEHOLDER.findall(original_group))
             terms = tuple(token for token in observed_tokens if token in term_placeholders)
@@ -793,7 +1072,7 @@ def _build_provider_projection(
                         _ProjectionCandidate(
                             start=start,
                             end=end,
-                            term_token=term_token,
+                            term_tokens=(term_token,),
                             fixed_expansion=original_group,
                         )
                     )
@@ -844,13 +1123,12 @@ def _build_provider_projection(
     previous_end = -1
     aliased_terms: set[str] = set()
     for group in groups:
-        if group.start < previous_end or (
-            group.term_token and group.term_token in aliased_terms
+        if group.start < previous_end or any(
+            term_token in aliased_terms for term_token in group.term_tokens
         ):
             raise TranslationError("内部エラー: 装飾範囲が重複しています")
         previous_end = group.end
-        if group.term_token:
-            aliased_terms.add(group.term_token)
+        aliased_terms.update(group.term_tokens)
 
     # Protector placeholders grow upward from 0000. Allocate projection-only
     # tokens downward and exclude every MQP-shaped value already in scope.
@@ -862,6 +1140,9 @@ def _build_provider_projection(
     next_index = 0xFFFF
     projected_groups: list[tuple[_ProjectionCandidate, str]] = []
     for group in groups:
+        if group.local_suffix:
+            projected_groups.append((group, ""))
+            continue
         provider_token = ""
         while next_index >= 0:
             candidate = f"__MQP_{next_index:04X}__"
@@ -880,33 +1161,37 @@ def _build_provider_projection(
 
     styled_index = 0
     styled_bodies: list[_StyledBodyProjection] = []
+    local_suffix_bodies: list[_StyledBodyProjection] = []
     for group, provider_token in projected_groups:
         if not group.body_source:
             continue
-        styled_bodies.append(
-            _StyledBodyProjection(
-                part_id=f"{part_id}::styled::{styled_index:04d}",
-                provider_token=provider_token,
-                source_text=group.body_source,
-                opening=group.opening,
-                reset=group.reset,
-            )
+        styled = _StyledBodyProjection(
+            part_id=f"{part_id}::styled::{styled_index:04d}",
+            provider_token=provider_token,
+            source_text=group.body_source,
+            opening=group.opening,
+            reset=group.reset,
         )
+        if group.local_suffix:
+            local_suffix_bodies.append(styled)
+        else:
+            styled_bodies.append(styled)
         styled_index += 1
 
     return _ProviderProjection(
         text=projected,
         term_token_aliases=tuple(
-            (group.term_token, provider_token)
+            (term_token, provider_token)
             for group, provider_token in projected_groups
-            if group.term_token
+            for term_token in group.term_tokens
         ),
         expansions=tuple(
             (provider_token, group.fixed_expansion)
             for group, provider_token in projected_groups
-            if group.fixed_expansion
+            if provider_token and group.fixed_expansion
         ),
         styled_bodies=tuple(styled_bodies),
+        local_suffix_bodies=tuple(local_suffix_bodies),
     )
 
 
@@ -929,10 +1214,15 @@ def _provider_item(
         "context": part.context if context is None else context,
     }
     bindings: list[dict[str, str]] = []
-    if len(part.protected.term_placeholders) != len(
-        part.protected.term_source_spans
+    if not (
+        len(part.protected.term_placeholders)
+        == len(part.protected.term_source_spans)
+        == len(part.protected.term_group_ids)
     ):
         raise TranslationError("内部エラー: 固有名詞の参照情報を生成できません")
+    fragments_by_provider_token: dict[
+        str, list[tuple[str, int, int]]
+    ] = {}
     for placeholder, (start, end) in zip(
         part.protected.term_placeholders,
         part.protected.term_source_spans,
@@ -942,11 +1232,47 @@ def _provider_item(
             0 <= start < end <= len(part.protected.original)
         ):
             raise TranslationError("内部エラー: 固有名詞の参照情報を生成できません")
+        provider_token = part.provider_projection.provider_token_for(placeholder)
+        fragments_by_provider_token.setdefault(provider_token, []).append(
+            (placeholder, start, end)
+        )
+    for provider_token, fragments in fragments_by_provider_token.items():
+        if len(fragments) == 1:
+            placeholder, start, end = fragments[0]
+            source_term = part.protected.original[start:end]
+            approved_output = part.protected.replacements[placeholder]
+        else:
+            source_start = min(start for _placeholder, start, _end in fragments)
+            source_end = max(end for _placeholder, _start, end in fragments)
+            source_term = visible_terminology_text(
+                [part.protected.original[source_start:source_end]]
+            )
+            first_position = part.protected.protected.find(fragments[0][0])
+            last_placeholder = fragments[-1][0]
+            last_position = part.protected.protected.find(last_placeholder)
+            if first_position < 0 or last_position < first_position:
+                raise TranslationError("内部エラー: 固有名詞groupを参照情報へ対応付けられません")
+            approved_template = part.protected.protected[
+                first_position : last_position + len(last_placeholder)
+            ]
+            for placeholder in _MQP_PLACEHOLDER.findall(approved_template):
+                replacement = part.protected.replacements.get(placeholder)
+                if replacement is None:
+                    raise TranslationError(
+                        "内部エラー: 固有名詞groupの保護tokenを復元できません"
+                    )
+                approved_template = approved_template.replace(
+                    placeholder,
+                    replacement,
+                )
+            approved_output = visible_terminology_text([approved_template])
+            if not source_term or not approved_output:
+                raise TranslationError("内部エラー: 固有名詞groupの参照情報が空です")
         bindings.append(
             {
-                "token": part.provider_projection.provider_token_for(placeholder),
-                "source_term": part.protected.original[start:end],
-                "approved_output": part.protected.replacements[placeholder],
+                "token": provider_token,
+                "source_term": source_term,
+                "approved_output": approved_output,
             }
         )
     if bindings:
@@ -1397,14 +1723,22 @@ def _make_prepared_part(
 ) -> _PreparedPart:
     projection = _build_provider_projection(protected, part_id)
     styled_parts: list[_PreparedPart] = []
-    for index, styled in enumerate(projection.styled_bodies, start=1):
+    projected_bodies = (
+        *projection.styled_bodies,
+        *projection.local_suffix_bodies,
+    )
+    for index, styled in enumerate(projected_bodies, start=1):
         body_protected = protector.protect(styled.source_text, term_spans=[])
         if body_protected.protected != styled.source_text or body_protected.replacements:
             raise TranslationError(
                 "内部エラー: 装飾本文に未分離の保護対象が含まれています"
             )
         body_projection = _build_provider_projection(body_protected, styled.part_id)
-        if body_projection.styled_bodies or body_projection.expansions:
+        if (
+            body_projection.styled_bodies
+            or body_projection.local_suffix_bodies
+            or body_projection.expansions
+        ):
             raise TranslationError("内部エラー: 装飾本文の翻訳階層が入れ子になっています")
         styled_parts.append(
             _PreparedPart(

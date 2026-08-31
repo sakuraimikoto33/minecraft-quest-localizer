@@ -150,6 +150,87 @@ class TokenProtectorTests(unittest.TestCase):
         with self.assertRaises(TranslationError):
             paragraph.restore("AB" + newline)
 
+    def test_escaped_ampersand_inside_one_term_allows_surrounding_prose_reorder(
+        self,
+    ) -> None:
+        source = r'More information about "Planets \& Dimensions" is here.'
+        left_start = source.index("Planets")
+        amp_start = source.index(r"\&")
+        right_start = amp_start + len(r"\&")
+        right_end = source.index('"', right_start)
+        protected = self.protector.protect(
+            source,
+            term_spans=(
+                TermReplacement(left_start, amp_start, "Planets ", 7),
+                TermReplacement(right_start, right_end, " Dimensions", 7),
+            ),
+        )
+        left, right = protected.term_placeholders
+        ampersand = next(
+            placeholder
+            for placeholder, value in protected.replacements.items()
+            if value == r"\&"
+        )
+
+        self.assertEqual(protected.flexible_structural_placeholders, (ampersand,))
+        self.assertEqual(
+            protected.restore(left + ampersand + right + "の詳細はこちらです。"),
+            r"Planets \& Dimensionsの詳細はこちらです。",
+        )
+        with self.assertRaises(TranslationError):
+            protected.restore(left + ampersand + right)
+
+        ungrouped = self.protector.protect(
+            source,
+            term_spans=(
+                TermReplacement(left_start, amp_start, "Planets "),
+                TermReplacement(right_start, right_end, " Dimensions"),
+            ),
+        )
+        ungrouped_left, ungrouped_right = ungrouped.term_placeholders
+        ungrouped_ampersand = next(
+            placeholder
+            for placeholder, value in ungrouped.replacements.items()
+            if value == r"\&"
+        )
+        with self.assertRaises(TranslationError):
+            ungrouped.restore(
+                ungrouped_left
+                + ungrouped_ampersand
+                + ungrouped_right
+                + "の詳細はこちらです。"
+            )
+
+    def test_grouped_ampersand_does_not_relax_an_adjacent_newline(self) -> None:
+        source = r"Prefix Planets \& Dimensions" + "\nSecond"
+        left_start = source.index("Planets")
+        amp_start = source.index(r"\&")
+        right_start = amp_start + len(r"\&")
+        right_end = right_start + len(" Dimensions")
+        protected = self.protector.protect(
+            source,
+            term_spans=(
+                TermReplacement(left_start, amp_start, "Planets ", 3),
+                TermReplacement(right_start, right_end, " Dimensions", 3),
+            ),
+        )
+        newline = next(
+            placeholder
+            for placeholder, value in protected.replacements.items()
+            if value == "\n"
+        )
+        ampersand = next(
+            placeholder
+            for placeholder, value in protected.replacements.items()
+            if value == r"\&"
+        )
+        left, right = protected.term_placeholders
+
+        with self.assertRaises(TranslationError):
+            protected.restore(
+                left + ampersand + right + newline + "Second Prefix"
+            )
+
     def test_closed_formatting_groups_may_reorder_for_japanese_grammar(self) -> None:
         source = "Put §aA§r before §bB§r"
         protected = self.protector.protect(source)

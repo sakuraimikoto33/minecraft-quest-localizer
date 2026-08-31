@@ -493,7 +493,16 @@ class OpenAIResponseTests(unittest.TestCase):
         )
         self.assertEqual(
             u1_schema["properties"]["token_positions"]["properties"]["token_0000"],
-            {"type": "integer"},
+            {"$ref": "#/$defs/token_position_0001"},
+        )
+        self.assertEqual(
+            schema["$defs"],
+            {
+                "token_position_0001": {
+                    "type": "integer",
+                    "enum": [0],
+                }
+            },
         )
         u2_schema = translations_schema["properties"]["item_0001"]
         self.assertEqual(
@@ -514,6 +523,92 @@ class OpenAIResponseTests(unittest.TestCase):
             + IMMUTABLE_TRANSLATION_PROTOCOL
             + "\n\n"
             + JAPANESE_UNICODE_INSTRUCTIONS,
+        )
+
+    def test_token_position_enum_definition_is_reused_for_same_count(self) -> None:
+        items = openai_client_module._prepare_structured_translation_items(
+            [
+                {
+                    "id": "u1",
+                    "text": "A __MQP_0000__ B __MQP_0001__ C",
+                },
+                {
+                    "id": "u2",
+                    "text": "D __MQP_0002__ E __MQP_0003__ F",
+                },
+            ]
+        )
+
+        schema = openai_client_module._structured_translation_schema(items)
+
+        self.assertEqual(
+            schema["$defs"],
+            {
+                "token_position_0002": {
+                    "type": "integer",
+                    "enum": [0, 1],
+                }
+            },
+        )
+        translations = schema["properties"]["translations"]["properties"]
+        for response_key in ("item_0000", "item_0001"):
+            position_properties = translations[response_key]["properties"][
+                "token_positions"
+            ]["properties"]
+            self.assertEqual(
+                position_properties,
+                {
+                    "token_0000": {
+                        "$ref": "#/$defs/token_position_0002"
+                    },
+                    "token_0001": {
+                        "$ref": "#/$defs/token_position_0002"
+                    },
+                },
+            )
+
+    def test_token_position_enum_budget_prefers_smaller_counts(self) -> None:
+        items = openai_client_module._prepare_structured_translation_items(
+            [
+                {"id": "one", "text": "A __MQP_0000__ B"},
+                {
+                    "id": "two",
+                    "text": "C __MQP_0001__ D __MQP_0002__ E",
+                },
+            ]
+        )
+
+        with patch.object(
+            openai_client_module,
+            "_MAX_STRUCTURED_OUTPUT_ENUM_VALUES",
+            2,
+        ):
+            schema = openai_client_module._structured_translation_schema(items)
+
+        self.assertEqual(
+            schema["$defs"],
+            {
+                "token_position_0001": {
+                    "type": "integer",
+                    "enum": [0],
+                }
+            },
+        )
+        translations = schema["properties"]["translations"]["properties"]
+        self.assertEqual(
+            translations["item_0000"]["properties"]["token_positions"][
+                "properties"
+            ]["token_0000"],
+            {"$ref": "#/$defs/token_position_0001"},
+        )
+        self.assertEqual(
+            translations["item_0001"]["properties"]["token_positions"][
+                "properties"
+            ],
+            {
+                "token_0000": {"type": "integer"},
+                "token_0001": {"type": "integer"},
+            },
         )
 
     def test_fast_mode_adds_priority_service_tier_only_to_responses_request(self) -> None:
@@ -1120,6 +1215,35 @@ class OpenAIResponseTests(unittest.TestCase):
                         "key", "gpt-test", item, "en_us", "ja_jp"
                     )
                 self.assertEqual(raised.exception.item_id, "u1")
+
+    def test_single_token_one_based_position_is_still_rejected_locally(self) -> None:
+        response = {
+            "translations": {
+                "item_0000": {
+                    "fragments": {
+                        "fragment_0000": "前",
+                        "fragment_0001": "後",
+                    },
+                    "token_positions": {"token_0000": 1},
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(
+            OpenAIResponseProtocolError,
+            "token位置が範囲外",
+        ) as raised:
+            OpenAIClient(
+                transport=SequenceTransport(_output_text(response))
+            ).translate_batch(
+                "key",
+                "gpt-test",
+                [{"id": "u1", "text": "A __MQP_0000__ B"}],
+                "en_us",
+                "ja_jp",
+            )
+
+        self.assertEqual(raised.exception.item_id, "u1")
 
     def test_fragment_cannot_contain_mqp_like_or_protected_syntax(self) -> None:
         unsafe_fragments = [

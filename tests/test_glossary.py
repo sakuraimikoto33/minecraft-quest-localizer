@@ -1892,6 +1892,8 @@ class ModLanguageScannerTests(unittest.TestCase):
         styled = "Elemental&bCraft"
         styled_spans = catalog.replacement_spans_for_parts([styled])[0]
         self.assertEqual(len(styled_spans), 2)
+        self.assertIsNotNone(styled_spans[0].group_id)
+        self.assertEqual(styled_spans[0].group_id, styled_spans[1].group_id)
         styled_protected = TokenProtector().protect(styled, term_spans=styled_spans)
         self.assertEqual(styled_protected.restore(styled_protected.protected), styled)
 
@@ -2063,6 +2065,97 @@ class ModLanguageScannerTests(unittest.TestCase):
         split_replacements = catalog.replacements_for_parts(["Modern ", "Industrialization"])
         self.assertEqual(split_replacements[0], {"Modern ": "Modern "})
         self.assertEqual(split_replacements[1], {"Industrialization": "Industrialization"})
+
+    def test_concrete_neoforge_metadata_ignores_inactive_forge_template(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            jar = Path(directory) / "enhancedbossbars.jar"
+            _write_jar(
+                jar,
+                {
+                    "META-INF/neoforge.mods.toml": (
+                        'modLoader="javafml"\n'
+                        'loaderVersion="[1,)"\n'
+                        '[[mods]]\n'
+                        'modId="enhancedbossbars"\n'
+                        'displayName="Enhanced Boss Bars"\n'
+                    ),
+                    "META-INF/mods.toml": (
+                        'modLoader="javafml"\n'
+                        'loaderVersion="[1,)"\n'
+                        '[[mods]]\n'
+                        'modId="${mod_id}"\n'
+                        'displayName="${mod_name}"\n'
+                        '[[dependencies.${mod_id}]]\n'
+                    ),
+                    "assets/enhancedbossbars/lang/en_us.json": _json(
+                        {"item.enhancedbossbars.example": "Example Boss Bar"}
+                    ),
+                },
+            )
+
+            catalog = ModLanguageScanner().scan(jar, "en_us", "ja_jp")
+
+        self.assertEqual(catalog.warnings, [])
+        self.assertIn("Enhanced Boss Bars", catalog.entries)
+        self.assertIn("Example Boss Bar", catalog.entries)
+
+    def test_neoforge_metadata_does_not_hide_other_forge_metadata_errors(self) -> None:
+        broken_forge_metadata = (
+            "# ${mod_id} appears only in a comment\n"
+            "[[mods]\n"
+            'modId="broken"\n'
+        )
+        mixed_forge_metadata = (
+            '[[mods]]\nmodId="forge_addon"\n'
+            'displayName="Forge Addon"\n'
+            '[[dependencies.${mod_id}]]\n'
+        )
+        for name, forge_metadata in (
+            ("unrelated-broken", broken_forge_metadata),
+            ("mixed-template", mixed_forge_metadata),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                jar = Path(directory) / f"{name}.jar"
+                _write_jar(
+                    jar,
+                    {
+                        "META-INF/neoforge.mods.toml": (
+                            '[[mods]]\nmodId="neo_main"\n'
+                            'displayName="Neo Main"\n'
+                        ),
+                        "META-INF/mods.toml": forge_metadata,
+                    },
+                )
+
+                catalog = ModLanguageScanner().scan(jar, "en_us", "ja_jp")
+
+                self.assertIn("Neo Main", catalog.entries)
+                self.assertTrue(
+                    any("META-INF/mods.toml" in warning for warning in catalog.warnings)
+                )
+
+    def test_valid_neoforge_and_forge_metadata_are_both_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            jar = Path(directory) / "dual-loader.jar"
+            _write_jar(
+                jar,
+                {
+                    "META-INF/neoforge.mods.toml": (
+                        '[[mods]]\nmodId="neo_main"\n'
+                        'displayName="Neo Main"\n'
+                    ),
+                    "META-INF/mods.toml": (
+                        '[[mods]]\nmodId="forge_addon"\n'
+                        'displayName="Forge Addon"\n'
+                    ),
+                },
+            )
+
+            catalog = ModLanguageScanner().scan(jar, "en_us", "ja_jp")
+
+        self.assertEqual(catalog.warnings, [])
+        self.assertIn("Neo Main", catalog.entries)
+        self.assertIn("Forge Addon", catalog.entries)
 
     def test_cjk_mod_name_is_protected_before_a_japanese_particle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2652,6 +2745,323 @@ class ModLanguageScannerTests(unittest.TestCase):
 
         self.assertIn("Eidolon:Repraised", catalog.entries)
         self.assertFalse(any("key.categories.branded" in warning for warning in catalog.warnings))
+
+    def test_eidolon_family_names_are_preserved_without_cross_mod_borrowing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mods = Path(directory)
+            jar = mods / "eidolon-repraised.jar"
+            _write_jar(
+                jar,
+                {
+                    "META-INF/neoforge.mods.toml": (
+                        '[[mods]]\nmodId="eidolon_repraised"\n'
+                        'displayName="Eidolon : Repraised"\n'
+                    ),
+                    "assets/eidolon_repraised/lang/en_us.json": _json(
+                        {
+                            "item.eidolon_repraised.arcane_gold_ingot": (
+                                "Arcane Gold Ingot"
+                            ),
+                            "item.eidolon_repraised.arcane_gold_nugget": (
+                                "Arcane Gold Nugget"
+                            ),
+                            "block.eidolon_repraised.arcane_gold_block": (
+                                "Arcane Gold Block"
+                            ),
+                            "item.eidolon_repraised.lesser_soul_gem": (
+                                "Lesser Soul Gem"
+                            ),
+                            "item.eidolon_repraised.shadow_gem": "Shadow Gem",
+                            # This is a real Codex label, not a registry term.
+                            # The material family must provide the private alias.
+                            "eidolon_repraised.codex.chapter.arcane_gold": (
+                                "Arcane Gold"
+                            ),
+                            # This short Codex family name is independently
+                            # corroborated by the registered Lesser Soul Gem.
+                            "eidolon_repraised.codex.chapter.soul_gems": (
+                                "Soul Gems"
+                            ),
+                        }
+                    ),
+                    "assets/eidolon_repraised/models/item/lesser_soul_gem.json": "{}",
+                },
+            )
+            _write_jar(
+                mods / "occultism.jar",
+                {
+                    "fabric.mod.json": _json(
+                        {
+                            "schemaVersion": 1,
+                            "id": "occultism",
+                            "name": "Occultism",
+                        }
+                    ),
+                    "assets/occultism/lang/en_us.json": _json(
+                        {"item.occultism.soul_gem": "Soul Gem"}
+                    ),
+                    "assets/occultism/lang/ja_jp.json": _json(
+                        {"item.occultism.soul_gem": "魂の宝石"}
+                    ),
+                    "assets/occultism/models/item/soul_gem.json": "{}",
+                },
+            )
+
+            catalog = ModLanguageScanner().scan(mods, "en_us", "ja_jp")
+
+        self.assertNotIn("Arcane Gold", catalog.entries)
+        self.assertEqual(catalog.entries["Soul Gem"].target, "魂の宝石")
+        self.assertEqual(catalog.entries["Soul Gems"].target, "Soul Gems")
+        self.assertEqual(
+            catalog.entries["Soul Gems"].key,
+            "eidolon_repraised.codex.chapter.soul_gems",
+        )
+        self.assertEqual(
+            catalog.replacements_for("Arcane Gold is used in rituals."),
+            {"Arcane Gold": "Arcane Gold"},
+        )
+        self.assertEqual(
+            catalog.replacements_for("Use an Arcane Gold Ingot."),
+            {"Arcane Gold Ingot": "Arcane Gold Ingot"},
+        )
+        self.assertEqual(
+            catalog.replacements_for(
+                "Arcane Gold, Soul Gems, and Shadow Gems are your alchemy staples."
+            ),
+            {
+                "Arcane Gold": "Arcane Gold",
+                "Soul Gems": "Soul Gems",
+                "Shadow Gems": "Shadow Gems",
+            },
+        )
+        self.assertFalse(
+            catalog.candidate_preserves_terms(
+                ["Arcane Gold, Soul Gems, and Shadow Gems are your alchemy staples."],
+                ["Arcane Gold、魂の宝石、Shadow Gemsは錬金術の必需品です。"],
+            )
+        )
+        # The derived base is deliberately weak: it must not claim part of a
+        # different proper name or generate another guessed plural.
+        self.assertEqual(catalog.replacements_for("Arcane Gold Dust"), {})
+        self.assertEqual(catalog.replacements_for("Mystic Arcane Gold"), {})
+        self.assertEqual(catalog.replacements_for("Arcane Golds"), {})
+
+    def test_codex_family_name_requires_same_namespace_registry_corroboration(self) -> None:
+        source_labels = {
+            "item.example.lesser_soul_gem": "Lesser Soul Gem",
+            "example.codex.chapter.soul_gems": "Soul Gems",
+            "other.codex.chapter.soul_gems": "Soul Gems",
+            "example.codex.chapter.soul_stones": "Soul Stones",
+            "example.codex.chapter.gems": "Gems",
+            "example.codex.page.soul_gems": "Soul Gems",
+            "item.example.lesser_mana_gem": "Lesser Mana Gem",
+            "example.codex.chapter.mana_gems": "Mana Gems",
+        }
+
+        proven = glossary_module._registry_backed_codex_chapter_keys(
+            source_labels,
+            frozenset({"item.example.lesser_soul_gem"}),
+        )
+
+        self.assertEqual(
+            proven,
+            frozenset({"example.codex.chapter.soul_gems"}),
+        )
+        self.assertEqual(
+            glossary_module._registry_backed_codex_chapter_keys(
+                source_labels,
+                frozenset(),
+            ),
+            frozenset(),
+        )
+
+    def test_material_base_requires_one_complete_key_aligned_family(self) -> None:
+        def source_only(
+            source: str,
+            key: str,
+            mod_id: str = "example",
+            source_tier: glossary_module._SourceTier = "mod",
+        ) -> GlossaryEntry:
+            return GlossaryEntry(
+                source=source,
+                target=source,
+                key=key,
+                mod_id=mod_id,
+                translated=False,
+                provenance=key,
+                target_state="missing",
+                source_tier=source_tier,
+            )
+
+        incomplete = GlossaryCatalog(
+            entries={
+                "Arcane Gold Ingot": source_only(
+                    "Arcane Gold Ingot", "item.example.arcane_gold_ingot"
+                ),
+                "Arcane Gold Nugget": source_only(
+                    "Arcane Gold Nugget", "item.example.arcane_gold_nugget"
+                ),
+            }
+        )
+        mismatched_key = GlossaryCatalog(
+            entries={
+                "Arcane Gold Ingot": source_only(
+                    "Arcane Gold Ingot", "item.example.arcane_gold_ingot"
+                ),
+                "Arcane Gold Nugget": source_only(
+                    "Arcane Gold Nugget", "item.example.mana_gold_nugget"
+                ),
+                "Arcane Gold Block": source_only(
+                    "Arcane Gold Block", "block.example.arcane_gold_block"
+                ),
+            }
+        )
+        split_providers = GlossaryCatalog(
+            entries={
+                "Arcane Gold Ingot": source_only(
+                    "Arcane Gold Ingot",
+                    "item.alpha.arcane_gold_ingot",
+                    "alpha",
+                ),
+                "Arcane Gold Nugget": source_only(
+                    "Arcane Gold Nugget",
+                    "item.alpha.arcane_gold_nugget",
+                    "alpha",
+                ),
+                "Arcane Gold Block": source_only(
+                    "Arcane Gold Block",
+                    "block.beta.arcane_gold_block",
+                    "beta",
+                ),
+            }
+        )
+        one_word_base = GlossaryCatalog(
+            entries={
+                "Iron Ingot": source_only(
+                    "Iron Ingot", "item.minecraft.iron_ingot", "minecraft"
+                ),
+                "Iron Nugget": source_only(
+                    "Iron Nugget", "item.minecraft.iron_nugget", "minecraft"
+                ),
+                "Iron Block": source_only(
+                    "Iron Block", "block.minecraft.iron_block", "minecraft"
+                ),
+            }
+        )
+        mixed_fallback_tiers = GlossaryCatalog(
+            entries={
+                "Arcane Gold Ingot": source_only(
+                    "Arcane Gold Ingot",
+                    "item.example.arcane_gold_ingot",
+                    source_tier="mod",
+                ),
+                "Arcane Gold Nugget": source_only(
+                    "Arcane Gold Nugget",
+                    "item.example.arcane_gold_nugget",
+                    source_tier="kubejs",
+                ),
+                "Arcane Gold Block": source_only(
+                    "Arcane Gold Block",
+                    "block.example.arcane_gold_block",
+                    source_tier="resourcepack",
+                ),
+            }
+        )
+
+        for name, catalog in (
+            ("incomplete", incomplete),
+            ("mismatched key", mismatched_key),
+            ("split providers", split_providers),
+            ("one-word base", one_word_base),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    catalog.replacements_for("Use Arcane Gold for this recipe."),
+                    {},
+                )
+        self.assertNotIn(
+            "Iron",
+            one_word_base.replacements_for("Iron out the details."),
+        )
+        self.assertEqual(
+            mixed_fallback_tiers.replacements_for("Use Arcane Gold."),
+            {"Arcane Gold": "Arcane Gold"},
+        )
+
+    def test_material_base_never_guesses_a_translation_and_exact_entry_wins(self) -> None:
+        def translated(source: str, target: str, key: str) -> GlossaryEntry:
+            return GlossaryEntry(
+                source=source,
+                target=target,
+                key=key,
+                mod_id="example",
+                translated=True,
+                provenance=key,
+                target_state="translated",
+            )
+
+        family = {
+            "Arcane Gold Ingot": translated(
+                "Arcane Gold Ingot",
+                "秘儀の金インゴット",
+                "item.example.arcane_gold_ingot",
+            ),
+            "Arcane Gold Nugget": translated(
+                "Arcane Gold Nugget", "秘儀の金塊", "item.example.arcane_gold_nugget"
+            ),
+            "Arcane Gold Block": translated(
+                "Arcane Gold Block",
+                "秘儀の金ブロック",
+                "block.example.arcane_gold_block",
+            ),
+        }
+        derived = GlossaryCatalog(entries=family)
+        exact = GlossaryCatalog(
+            entries={
+                **family,
+                "Arcane Gold": translated(
+                    "Arcane Gold", "秘儀の金", "item.example.arcane_gold"
+                ),
+            }
+        )
+        plural_collision = GlossaryCatalog(
+            entries={
+                "Arcane Shard": translated(
+                    "Arcane Shard", "秘片", "item.example.arcane_shard"
+                ),
+                "Arcane Shards Ingot": translated(
+                    "Arcane Shards Ingot",
+                    "秘片インゴット",
+                    "item.example.arcane_shards_ingot",
+                ),
+                "Arcane Shards Nugget": translated(
+                    "Arcane Shards Nugget",
+                    "秘片ナゲット",
+                    "item.example.arcane_shards_nugget",
+                ),
+                "Arcane Shards Block": translated(
+                    "Arcane Shards Block",
+                    "秘片ブロック",
+                    "block.example.arcane_shards_block",
+                ),
+            }
+        )
+
+        self.assertEqual(
+            derived.replacements_for("Use Arcane Gold and an Arcane Gold Ingot."),
+            {
+                "Arcane Gold": "Arcane Gold",
+                "Arcane Gold Ingot": "秘儀の金インゴット",
+            },
+        )
+        self.assertEqual(
+            exact.replacements_for("Use Arcane Gold."),
+            {"Arcane Gold": "秘儀の金"},
+        )
+        self.assertEqual(
+            plural_collision.replacements_for("Use Arcane Shards."),
+            {"Arcane Shards": "Arcane Shards"},
+        )
 
     def test_minecraft_assets_supply_plural_alias_over_untranslated_tag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3735,8 +4145,13 @@ class ModLanguageScannerTests(unittest.TestCase):
                         {"schemaVersion": 1, "id": "joined", "name": "Joined Mod"}
                     ),
                     "assets/joined/lang/en_us.json": _json(
-                        {"item.joined.relic": "Joined Relic"}
+                        {
+                            "item.joined.relic": "Joined Relic",
+                            "item.joined.lesser_soul_gem": "Lesser Soul Gem",
+                            "joined.codex.chapter.soul_gems": "Soul Gems",
+                        }
                     ),
+                    "assets/joined/models/item/lesser_soul_gem.json": "{}",
                 },
             )
             target_lang = (
@@ -3752,6 +4167,7 @@ class ModLanguageScannerTests(unittest.TestCase):
                 _json(
                     {
                         "item.joined.relic": "結合された遺物",
+                        "joined.codex.chapter.soul_gems": "ソウルジェム",
                         "item.joined.unproven": "原文証拠のない値",
                     }
                 ),
@@ -3769,6 +4185,8 @@ class ModLanguageScannerTests(unittest.TestCase):
         self.assertEqual(catalog.entries["Joined Relic"].target, "結合された遺物")
         self.assertTrue(catalog.entries["Joined Relic"].translated)
         self.assertIn("target-only", catalog.entries["Joined Relic"].provenance)
+        self.assertEqual(catalog.entries["Soul Gems"].target, "ソウルジェム")
+        self.assertEqual(catalog.entries["Soul Gems"].source_tier, "resourcepack")
         self.assertNotIn("原文証拠のない値", catalog.entries)
 
     def test_target_only_warning_escapes_and_bounds_untrusted_keys(self) -> None:
