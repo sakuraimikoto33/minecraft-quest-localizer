@@ -64,7 +64,13 @@ class SessionAnalysisLogTests(unittest.TestCase):
                 created.append(logger.write(f"session {index}"))
 
             remaining = sorted(path for path in log_dir.glob("analysis-*.log") if path != lookalike)
-            self.assertEqual(remaining, created[-3:])
+            expected = created[-3:]
+            self.assertEqual(
+                [path.name for path in remaining],
+                [path.name for path in expected],
+            )
+            for actual, expected_path in zip(remaining, expected, strict=True):
+                self.assertTrue(actual.samefile(expected_path))
             self.assertTrue(unrelated.exists())
             self.assertEqual(lookalike.read_text(encoding="utf-8"), "not an application log")
 

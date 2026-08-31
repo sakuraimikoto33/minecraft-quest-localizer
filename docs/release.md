@@ -16,7 +16,7 @@ workflowは次の場合に起動します。
 - package / Release用workflowまたは判定scriptが変更される
 - GitHub Actions画面から手動実行する
 
-README、`docs/**`、通常の`tests/**`、LICENSEだけの変更では起動しません。workflowや判定scriptだけの変更で起動した場合も、前回のVersion付きRelease以降に実アプリの差分がなければbuild jobを実行しません。
+README、`docs/**`、LICENSEだけの変更では起動しません。テスト、workflow、判定scriptだけの変更ではWindows上のテストを実行しますが、前回のVersion付きRelease以降に実アプリの差分がなければbuild jobを実行しません。
 
 実アプリの差分として扱う範囲は `src/**`、`launch.pyw`、`pyproject.toml` です。将来icon、PyInstaller spec、実行時assetを追加した場合は、workflowの起動pathとrelease plannerの実アプリpathへ追加する必要があります。
 
@@ -39,7 +39,7 @@ __version__ = "1.0.0"
 
 公開済み・非draftで、tagが `v<PEP 440 version>` または `<PEP 440 version>` のReleaseを全ページ取得します。その中の最大バージョンを「前回のVersion付きRelease」とし、対応tagのcommitから現在のcommitまでを比較します。
 
-- 前回Release以降に実アプリ差分がある場合だけ、全テストと単一EXE buildを実行します。
+- Windows上の全テストに成功し、前回Release以降に実アプリ差分がある場合だけ単一EXE buildを実行します。
 - Version付きReleaseがまだない場合は初回buildとして扱います。
 - `nightly` 等のVersionとして解釈できないRelease tagは比較対象外です。
 - 同じ最大バージョンを表す公開Releaseが複数ある場合や、Release tagとそのcommit内の `pyproject.toml` が一致しない場合は、安全に判定できないため停止します。

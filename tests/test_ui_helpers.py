@@ -2368,7 +2368,7 @@ class HighDpiLayoutTests(unittest.TestCase):
             self.assertTrue(main.detected_output_var.get().endswith("ja_jp.snbt"))
             analysis_log = Path(main.detected_log_var.get())
             self.assertTrue(analysis_log.is_file())
-            self.assertEqual(analysis_log.parent, store.path.parent / "logs")
+            self.assertTrue(analysis_log.parent.samefile(store.path.parent / "logs"))
             session_text = analysis_log.read_text(encoding="utf-8")
             self.assertIn("Minecraft Quest Localizer セッションログ", session_text)
             self.assertIn("解析開始", session_text)
