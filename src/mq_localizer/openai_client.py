@@ -80,6 +80,44 @@ _MQP_LIKE_PATTERN = re.compile(
     r"(?:__\s*MQP\s*_|MQP(?:[_\-*`\\\s])*[0-9A-F]{4})",
     re.IGNORECASE,
 )
+_CONFIDENTIAL_DEBUG_FIELDS = frozenset(
+    {
+        "authorization",
+        "proxy_authorization",
+        "cookie",
+        "set_cookie",
+        "x_api_key",
+        "api_key",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "password",
+    }
+)
+_CONFIDENTIAL_DEBUG_FIELD_PATTERN = (
+    r"(?:authorization|proxy[-_]authorization|cookie|set[-_]cookie|"
+    r"x[-_]api[-_]key|api[-_]key|access[-_]token|refresh[-_]token|"
+    r"client[-_]secret|password)"
+)
+_JSON_STRING_PATTERN = r'"(?:\\.|[^"\\])*"'
+_EMBEDDED_CONFIDENTIAL_JSON_PREFIX_PATTERN = re.compile(
+    rf'"{_CONFIDENTIAL_DEBUG_FIELD_PATTERN}"\s*:\s*',
+    re.IGNORECASE,
+)
+_EMBEDDED_CONFIDENTIAL_JSON_PATTERN = re.compile(
+    rf'(?P<prefix>"{_CONFIDENTIAL_DEBUG_FIELD_PATTERN}"\s*:\s*)'
+    rf"(?P<value>{_JSON_STRING_PATTERN}|[^\s,}}\]]+)",
+    re.IGNORECASE,
+)
+_CONFIDENTIAL_FREE_TEXT_ASSIGNMENT_PATTERN = re.compile(
+    rf"(?P<prefix>\b{_CONFIDENTIAL_DEBUG_FIELD_PATTERN}\b\s*[=:]\s*)"
+    r"[^\r\n]*",
+    re.IGNORECASE,
+)
+
+
+class _DebugJSONObject(list[tuple[str, Any]]):
+    """JSON object pairs retained while sanitizing embedded JSON strings."""
 
 
 def _is_retryable_http_status(status: int | None) -> bool:
@@ -152,6 +190,7 @@ class OpenAIAPIError(TranslationError):
         *,
         retryable: bool | None = None,
         kind: str | None = None,
+        debug_body: object | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -166,6 +205,9 @@ class OpenAIAPIError(TranslationError):
             else bool(retryable)
         )
         self.kind = kind or ("http" if status is not None else "api")
+        # Kept out of the user-facing exception text.  The opt-in debug hook
+        # sanitizes this value before it can be persisted.
+        self.debug_body = debug_body
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,19 +249,42 @@ class UrllibJsonTransport:
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 response_bytes = _read_limited_response(response, _MAX_API_RESPONSE_BYTES)
-                response_data = response_bytes.decode("utf-8")
-                parsed = json.loads(response_data)
+                try:
+                    response_data = response_bytes.decode("utf-8")
+                except UnicodeError as exc:
+                    raise OpenAIAPIError(
+                        "OpenAI API からUTF-8ではない応答を受信しました",
+                        kind="invalid_response",
+                        debug_body=response_bytes.decode(
+                            "utf-8",
+                            errors="backslashreplace",
+                        ),
+                    ) from exc
+                try:
+                    parsed = json.loads(response_data)
+                except ValueError as exc:
+                    raise OpenAIAPIError(
+                        "OpenAI API から不正な JSON 応答を受信しました",
+                        kind="invalid_response",
+                        debug_body=response_data,
+                    ) from exc
                 if not isinstance(parsed, dict):
                     raise OpenAIAPIError(
                         "OpenAI API から不正な JSON 応答を受信しました",
                         kind="invalid_response",
+                        debug_body=parsed,
                     )
                 return parsed
         except urllib.error.HTTPError as exc:
             request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
+            debug_body: object | None = None
             try:
                 error_bytes = _read_limited_response(exc, _MAX_API_RESPONSE_BYTES)
-                error_body = json.loads(error_bytes.decode("utf-8"))
+                debug_body = error_bytes.decode("utf-8", errors="backslashreplace")
+                error_text = error_bytes.decode("utf-8")
+                debug_body = error_text
+                error_body = json.loads(error_text)
+                debug_body = error_body
                 message = (
                     error_body.get("error", {}).get("message", str(exc))
                     if isinstance(error_body, dict) and isinstance(error_body.get("error"), dict)
@@ -263,6 +328,7 @@ class UrllibJsonTransport:
                 exc.code,
                 request_id,
                 kind="http",
+                debug_body=debug_body,
             ) from exc
         except (ssl.SSLCertVerificationError, ssl.CertificateError) as exc:
             raise OpenAIAPIError(
@@ -741,12 +807,14 @@ class OpenAIClient:
         max_retries: int = 3,
         translation_prompt: str = DEFAULT_TRANSLATION_PROMPT,
         on_retry: Callable[[OpenAIRetryEvent], None] | None = None,
+        on_debug: Callable[[str], None] | None = None,
     ) -> None:
         self.transport = transport or UrllibJsonTransport()
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max(0, max_retries)
         self.on_retry = on_retry
+        self.on_debug = on_debug
         stripped_prompt = translation_prompt.strip()
         self.translation_prompt = stripped_prompt or DEFAULT_TRANSLATION_PROMPT
 
@@ -869,7 +937,25 @@ class OpenAIClient:
         }
         for attempt in range(self.max_retries + 1):
             if cancel and cancel.is_set():
-                raise CancelledError("処理をキャンセルしました")
+                cancelled = CancelledError("処理をキャンセルしました")
+                self._emit_debug(
+                    "CANCELLED",
+                    method,
+                    endpoint,
+                    attempt,
+                    api_key,
+                    error=cancelled,
+                )
+                raise cancelled
+            self._emit_debug(
+                "REQUEST",
+                method,
+                endpoint,
+                attempt,
+                api_key,
+                headers=headers,
+                payload=payload,
+            )
             try:
                 response = _run_transport_request(
                     self.transport,
@@ -880,13 +966,30 @@ class OpenAIClient:
                     self.timeout,
                     cancel,
                 )
+                self._emit_debug(
+                    "RESPONSE",
+                    method,
+                    endpoint,
+                    attempt,
+                    api_key,
+                    response=response,
+                )
                 if not isinstance(response, dict):
                     raise OpenAIAPIError(
                         "OpenAI API から不正な JSON 応答を受信しました",
                         kind="invalid_response",
+                        debug_body=response,
                     )
                 return response
             except OpenAIAPIError as exc:
+                self._emit_debug(
+                    "ERROR",
+                    method,
+                    endpoint,
+                    attempt,
+                    api_key,
+                    error=exc,
+                )
                 if not exc.retryable or attempt >= self.max_retries:
                     suffix = f" (request id: {exc.request_id})" if exc.request_id else ""
                     raise OpenAIAPIError(
@@ -895,6 +998,7 @@ class OpenAIClient:
                         exc.request_id,
                         retryable=exc.retryable,
                         kind=exc.kind,
+                        debug_body=exc.debug_body,
                     ) from exc
                 delay = min(8.0, 1.0 * (2**attempt))
                 retry_event = OpenAIRetryEvent(
@@ -915,10 +1019,124 @@ class OpenAIClient:
                         pass
                 if cancel:
                     if cancel.wait(delay):
-                        raise CancelledError("処理をキャンセルしました")
+                        cancelled = CancelledError("処理をキャンセルしました")
+                        self._emit_debug(
+                            "CANCELLED",
+                            method,
+                            endpoint,
+                            attempt,
+                            api_key,
+                            error=cancelled,
+                        )
+                        raise cancelled
                 else:
                     time.sleep(delay)
+            except CancelledError as exc:
+                self._emit_debug(
+                    "CANCELLED",
+                    method,
+                    endpoint,
+                    attempt,
+                    api_key,
+                    error=exc,
+                )
+                raise
+            except Exception as exc:
+                self._emit_debug(
+                    "ERROR",
+                    method,
+                    endpoint,
+                    attempt,
+                    api_key,
+                    error=exc,
+                )
+                raise
         raise AssertionError("unreachable")
+
+    def _emit_debug(
+        self,
+        phase: str,
+        method: str,
+        endpoint: str,
+        attempt: int,
+        api_key: str,
+        *,
+        headers: dict[str, str] | None = None,
+        payload: dict[str, Any] | None = None,
+        response: object | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Publish a complete, sanitized API event without affecting requests."""
+
+        if self.on_debug is None:
+            return
+        try:
+            message = self._format_debug_event(
+                phase,
+                method,
+                endpoint,
+                attempt,
+                api_key,
+                headers=headers,
+                payload=payload,
+                response=response,
+                error=error,
+            )
+            self.on_debug(message)
+        except Exception:
+            # Debug formatting and persistence must never change request,
+            # retry, or cancel behavior.
+            pass
+
+    def _format_debug_event(
+        self,
+        phase: str,
+        method: str,
+        endpoint: str,
+        attempt: int,
+        api_key: str,
+        *,
+        headers: dict[str, str] | None,
+        payload: dict[str, Any] | None,
+        response: object | None,
+        error: BaseException | None,
+    ) -> str:
+        event: dict[str, Any] = {
+            "phase": phase,
+            "method": method,
+            "url": self.base_url + endpoint,
+            "attempt": attempt + 1,
+            "max_attempts": self.max_retries + 1,
+        }
+        if headers is not None:
+            event["headers"] = headers
+            event["payload"] = _redact_request_payload(payload, api_key)
+        if response is not None:
+            event["response"] = response
+        if error is not None:
+            error_detail: dict[str, Any] = {
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+            if isinstance(error, OpenAIAPIError):
+                error_detail.update(
+                    {
+                        "status": error.status,
+                        "request_id": error.request_id,
+                        "retryable": error.retryable,
+                        "kind": error.kind,
+                    }
+                )
+                if error.debug_body is not None:
+                    error_detail["response"] = error.debug_body
+            event["error"] = error_detail
+        safe_event = _redact_debug_value(event, api_key)
+        return "OpenAI " + phase + "\n" + json.dumps(
+            safe_event,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
 
 
 def _run_transport_request(
@@ -1106,3 +1324,122 @@ def _redact_sensitive(text: str, api_key: str = "") -> str:
         redacted = redacted.replace(stripped_key, "[API KEY REDACTED]")
     redacted = _BEARER_PATTERN.sub("Bearer [REDACTED]", redacted)
     return _API_KEY_PATTERN.sub("[API KEY REDACTED]", redacted)
+
+
+def _redact_inline_confidential_fields(text: str) -> str:
+    """Mask credential-shaped assignments embedded in otherwise free text."""
+
+    def replace(match: re.Match[str]) -> str:
+        return match.group("prefix") + '"[REDACTED]"'
+
+    # A free-text field may contain a complete JSON object/array as its value.
+    # Decode from the value boundary so every element is removed instead of
+    # masking only the first whitespace-delimited token.
+    decoder = json.JSONDecoder()
+    chunks: list[str] = []
+    cursor = 0
+    search_from = 0
+    while match := _EMBEDDED_CONFIDENTIAL_JSON_PREFIX_PATTERN.search(
+        text,
+        search_from,
+    ):
+        try:
+            _value, value_end = decoder.raw_decode(text, match.end())
+        except (TypeError, ValueError, RecursionError):
+            search_from = match.end()
+            continue
+        chunks.append(text[cursor:match.end()])
+        chunks.append('"[REDACTED]"')
+        cursor = value_end
+        search_from = value_end
+    if chunks:
+        chunks.append(text[cursor:])
+        text = "".join(chunks)
+
+    # Retain a conservative fallback for malformed quoted JSON, then mask an
+    # unquoted credential assignment through the end of its physical line.
+    # Headers such as Basic/Digest Authorization and multi-cookie values span
+    # several tokens, so stopping at the first space or semicolon can leak.
+    redacted = _EMBEDDED_CONFIDENTIAL_JSON_PATTERN.sub(replace, text)
+    return _CONFIDENTIAL_FREE_TEXT_ASSIGNMENT_PATTERN.sub(replace, redacted)
+
+
+def _render_debug_json_node(value: Any) -> str:
+    """Serialize pair-preserving JSON without collapsing duplicate object keys."""
+
+    if isinstance(value, _DebugJSONObject):
+        return "{" + ",".join(
+            json.dumps(key, ensure_ascii=False) + ":" + _render_debug_json_node(child)
+            for key, child in value
+        ) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(_render_debug_json_node(child) for child in value) + "]"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _redact_debug_node(value: Any, api_key: str, depth: int) -> Any:
+    if isinstance(value, _DebugJSONObject):
+        sanitized_pairs: _DebugJSONObject = _DebugJSONObject()
+        for key, child in value:
+            rendered_key = str(key)
+            normalized_key = rendered_key.casefold().replace("-", "_")
+            safe_key = _redact_sensitive(rendered_key, api_key)
+            sanitized_pairs.append(
+                (
+                    safe_key,
+                    "[REDACTED]"
+                    if normalized_key in _CONFIDENTIAL_DEBUG_FIELDS
+                    else _redact_debug_node(child, api_key, depth + 1),
+                )
+            )
+        return sanitized_pairs
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, child in value.items():
+            rendered_key = str(key)
+            normalized_key = rendered_key.casefold().replace("-", "_")
+            safe_key = _redact_sensitive(rendered_key, api_key)
+            if normalized_key in _CONFIDENTIAL_DEBUG_FIELDS:
+                sanitized[safe_key] = "[REDACTED]"
+            else:
+                sanitized[safe_key] = _redact_debug_node(child, api_key, depth + 1)
+        return sanitized
+    if isinstance(value, list):
+        return [_redact_debug_node(item, api_key, depth + 1) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_debug_node(item, api_key, depth + 1) for item in value]
+    if isinstance(value, str):
+        redacted = _redact_sensitive(value, api_key)
+        if depth < 32:
+            try:
+                parsed = json.loads(redacted, object_pairs_hook=_DebugJSONObject)
+            except (TypeError, ValueError, RecursionError):
+                pass
+            else:
+                if isinstance(parsed, (_DebugJSONObject, list)):
+                    sanitized_json = _redact_debug_node(parsed, api_key, depth + 1)
+                    return _render_debug_json_node(sanitized_json)
+        return _redact_inline_confidential_fields(redacted)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _redact_inline_confidential_fields(
+        _redact_sensitive(str(value), api_key)
+    )
+
+
+def _redact_debug_value(value: Any, api_key: str) -> Any:
+    """Recursively sanitize a debug event, including embedded JSON text."""
+
+    return _redact_debug_node(value, api_key, 0)
+
+
+def _redact_request_payload(
+    payload: dict[str, Any] | None,
+    api_key: str,
+) -> dict[str, Any] | None:
+    """Sanitize the JSON string used by the Responses API input field."""
+
+    if payload is None:
+        return None
+    sanitized = _redact_debug_value(payload, api_key)
+    return sanitized if isinstance(sanitized, dict) else None

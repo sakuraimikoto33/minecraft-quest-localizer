@@ -83,7 +83,196 @@ def _plain_translation_payload(**translations: str) -> dict[str, Any]:
     }
 
 
+def _parsed_debug_event(message: str) -> tuple[str, dict[str, Any]]:
+    heading, separator, payload = message.partition("\n")
+    if not separator:
+        raise AssertionError("debug event has no JSON payload")
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict):
+        raise AssertionError("debug event payload is not an object")
+    return heading, parsed
+
+
 class OpenAIModelTests(unittest.TestCase):
+    def test_debug_hook_records_full_models_request_and_response_with_secrets_masked(
+        self,
+    ) -> None:
+        api_key = "sk-proj-debug-api-key-1234567890"
+        response = {
+            "data": [
+                {
+                    "id": "gpt-debug",
+                    "created": 42,
+                    "owned_by": "openai",
+                }
+            ],
+            "access_token": "access-token-secret-value",
+            "refresh-token": "refresh-token-secret-value",
+            "client_secret": "client-secret-value",
+            "password": "password-secret-value",
+            "nested": {
+                "Cookie": "session=cookie-secret-value",
+                "Set-Cookie": "session=set-cookie-secret-value",
+                "X-API-Key": "secondary-api-key-secret-value",
+                "Proxy-Authorization": "Bearer proxy-secret-value",
+                "token_positions": {"token_0000": 0},
+                "echoed_key": api_key,
+                "bearer_text": "Bearer response-bearer-secret",
+                "pattern_key": "sk-proj-response-secret-123456",
+                api_key: "credential-shaped object key",
+                "sk-proj-response-key-secret-123456": "pattern-shaped object key",
+            },
+        }
+        events: list[str] = []
+
+        models = OpenAIClient(
+            transport=SequenceTransport(response),
+            base_url="https://unit.invalid/v1/",
+            timeout=17,
+            on_debug=events.append,
+        ).list_models(api_key)
+
+        self.assertEqual([model.id for model in models], ["gpt-debug"])
+        self.assertEqual(len(events), 2)
+        request_heading, request = _parsed_debug_event(events[0])
+        response_heading, recorded_response = _parsed_debug_event(events[1])
+        self.assertEqual(request_heading, "OpenAI REQUEST")
+        self.assertEqual(response_heading, "OpenAI RESPONSE")
+        self.assertEqual(
+            {
+                key: request[key]
+                for key in ("phase", "method", "url", "attempt", "max_attempts")
+            },
+            {
+                "phase": "REQUEST",
+                "method": "GET",
+                "url": "https://unit.invalid/v1/models",
+                "attempt": 1,
+                "max_attempts": 4,
+            },
+        )
+        self.assertEqual(
+            request["headers"],
+            {
+                "Authorization": "[REDACTED]",
+                "Content-Type": "application/json",
+                "User-Agent": "minecraft-quest-localizer/0.1",
+            },
+        )
+        self.assertIsNone(request["payload"])
+        self.assertEqual(recorded_response["phase"], "RESPONSE")
+        self.assertEqual(recorded_response["response"]["data"], response["data"])
+        self.assertEqual(
+            recorded_response["response"]["nested"]["token_positions"],
+            {"token_0000": 0},
+        )
+        for field in (
+            "access_token",
+            "refresh-token",
+            "client_secret",
+            "password",
+        ):
+            self.assertEqual(recorded_response["response"][field], "[REDACTED]")
+        for field in ("Cookie", "Set-Cookie", "X-API-Key", "Proxy-Authorization"):
+            self.assertEqual(
+                recorded_response["response"]["nested"][field],
+                "[REDACTED]",
+            )
+        combined = "\n".join(events)
+        for secret in (
+            api_key,
+            "access-token-secret-value",
+            "refresh-token-secret-value",
+            "client-secret-value",
+            "password-secret-value",
+            "cookie-secret-value",
+            "set-cookie-secret-value",
+            "secondary-api-key-secret-value",
+            "proxy-secret-value",
+            "response-bearer-secret",
+            "sk-proj-response-secret-123456",
+            "sk-proj-response-key-secret-123456",
+        ):
+            self.assertNotIn(secret, combined)
+
+    def test_debug_hook_records_every_retry_in_request_error_request_response_order(
+        self,
+    ) -> None:
+        events: list[str] = []
+        transport = SequenceTransport(
+            OpenAIAPIError(
+                "rate limited",
+                status=429,
+                request_id="req-debug-retry",
+                debug_body={
+                    "error": {"message": "retry later"},
+                    "access_token": "retry-secret-token",
+                },
+            ),
+            {"data": []},
+        )
+        client = OpenAIClient(
+            transport=transport,
+            max_retries=2,
+            on_debug=events.append,
+        )
+
+        with patch("mq_localizer.openai_client.time.sleep") as sleep:
+            self.assertEqual(client.list_models("sk-proj-retry-key-123456"), [])
+
+        parsed = [_parsed_debug_event(message)[1] for message in events]
+        self.assertEqual(
+            [event["phase"] for event in parsed],
+            ["REQUEST", "ERROR", "REQUEST", "RESPONSE"],
+        )
+        self.assertEqual([event["attempt"] for event in parsed], [1, 1, 2, 2])
+        self.assertTrue(all(event["max_attempts"] == 3 for event in parsed))
+        error = parsed[1]["error"]
+        self.assertEqual(error["status"], 429)
+        self.assertEqual(error["request_id"], "req-debug-retry")
+        self.assertTrue(error["retryable"])
+        self.assertEqual(error["kind"], "http")
+        self.assertEqual(error["response"]["error"], {"message": "retry later"})
+        self.assertEqual(error["response"]["access_token"], "[REDACTED]")
+        self.assertNotIn("retry-secret-token", "\n".join(events))
+        sleep.assert_called_once_with(1.0)
+
+    def test_debug_callback_failure_is_isolated_from_successful_request(self) -> None:
+        callback_calls: list[str] = []
+
+        def failing_debug_callback(message: str) -> None:
+            callback_calls.append(message)
+            raise RuntimeError("debug sink failed")
+
+        models = OpenAIClient(
+            transport=SequenceTransport({"data": []}),
+            on_debug=failing_debug_callback,
+        ).list_models("sk-proj-callback-key-123456")
+
+        self.assertEqual(models, [])
+        self.assertEqual(
+            [_parsed_debug_event(message)[1]["phase"] for message in callback_calls],
+            ["REQUEST", "RESPONSE"],
+        )
+
+    def test_invalid_non_json_response_is_safely_rendered_in_debug_log(self) -> None:
+        api_key = "sk-proj-binary-response-key-123456"
+        events: list[str] = []
+        client = OpenAIClient(
+            transport=SequenceTransport(b"invalid body " + api_key.encode("ascii")),
+            on_debug=events.append,
+        )
+
+        with self.assertRaises(OpenAIAPIError):
+            client.list_models(api_key)
+
+        self.assertEqual(
+            [_parsed_debug_event(message)[1]["phase"] for message in events],
+            ["REQUEST", "RESPONSE", "ERROR"],
+        )
+        self.assertNotIn(api_key, "\n".join(events))
+        self.assertIn("[API KEY REDACTED]", "\n".join(events))
+
     def test_urllib_transport_rejects_oversized_response(self) -> None:
         class OversizedResponse:
             def __enter__(self) -> "OversizedResponse":
@@ -264,8 +453,12 @@ class OpenAIModelTests(unittest.TestCase):
                 )
 
     def test_urllib_transport_malformed_json_is_not_retryable(self) -> None:
-        malformed_responses = (b"not-json", b"[]", b'"text"')
-        for response_bytes in malformed_responses:
+        malformed_responses = (
+            (b"not-json", "not-json"),
+            (b"[]", []),
+            (b'"text"', "text"),
+        )
+        for response_bytes, expected_debug_body in malformed_responses:
             with self.subTest(response=response_bytes):
                 with patch.object(
                     openai_client_module.urllib.request,
@@ -283,6 +476,38 @@ class OpenAIModelTests(unittest.TestCase):
 
                 self.assertFalse(caught.exception.retryable)
                 self.assertEqual(caught.exception.kind, "invalid_response")
+                self.assertEqual(caught.exception.debug_body, expected_debug_body)
+
+    def test_urllib_malformed_response_body_is_sanitized_in_client_debug_log(
+        self,
+    ) -> None:
+        secret = "malformed-client-secret-value"
+        response_bytes = (
+            f'not-json {{"client_secret":"{secret}"}}'.encode("utf-8")
+        )
+        events: list[str] = []
+
+        with patch.object(
+            openai_client_module.urllib.request,
+            "urlopen",
+            return_value=io.BytesIO(response_bytes),
+        ):
+            with self.assertRaises(OpenAIAPIError):
+                OpenAIClient(
+                    transport=UrllibJsonTransport(),
+                    base_url="https://unit.invalid/v1/",
+                    max_retries=0,
+                    on_debug=events.append,
+                ).list_models("key")
+
+        self.assertEqual(
+            [_parsed_debug_event(message)[1]["phase"] for message in events],
+            ["REQUEST", "ERROR"],
+        )
+        combined = "\n".join(events)
+        self.assertIn("not-json", combined)
+        self.assertNotIn(secret, combined)
+        self.assertIn("[REDACTED]", combined)
 
     def test_models_are_filtered_sorted_and_request_is_authenticated(self) -> None:
         transport = SequenceTransport(
@@ -353,7 +578,8 @@ class OpenAIModelTests(unittest.TestCase):
 
     def test_empty_key_and_pre_cancel_do_not_call_transport(self) -> None:
         transport = SequenceTransport({"data": []})
-        client = OpenAIClient(transport=transport)
+        debug_events: list[str] = []
+        client = OpenAIClient(transport=transport, on_debug=debug_events.append)
 
         with self.assertRaises(OpenAIAPIError):
             client.list_models("   ")
@@ -362,6 +588,10 @@ class OpenAIModelTests(unittest.TestCase):
         with self.assertRaises(CancelledError):
             client.list_models("key", cancelled)
         self.assertEqual(transport.calls, [])
+        self.assertEqual(
+            [_parsed_debug_event(message)[1]["phase"] for message in debug_events],
+            ["CANCELLED"],
+        )
 
     def test_active_blocking_transport_is_abandoned_on_cancel(self) -> None:
         cancel = Event()
@@ -395,6 +625,230 @@ class OpenAIModelTests(unittest.TestCase):
 
 
 class OpenAIResponseTests(unittest.TestCase):
+    def test_debug_hook_records_full_translation_request_and_response(self) -> None:
+        translated = _plain_translation_payload(u1="翻訳結果")
+        response = {
+            "id": "resp_debug_full",
+            "status": "completed",
+            "output_text": json.dumps(translated, ensure_ascii=False),
+            "usage": {
+                "input_tokens": 123,
+                "output_tokens": 45,
+                "total_tokens": 168,
+            },
+        }
+        transport = SequenceTransport(response)
+        events: list[str] = []
+        client = OpenAIClient(transport=transport, on_debug=events.append)
+
+        result = client.translate_batch(
+            "sk-proj-post-debug-key-123456",
+            "gpt-debug",
+            [{"id": "u1", "text": "Full source text", "context": "quest title"}],
+            "en_us",
+            "ja_jp",
+        )
+
+        self.assertEqual(result, {"u1": "翻訳結果"})
+        self.assertEqual(len(events), 2)
+        request_heading, request = _parsed_debug_event(events[0])
+        response_heading, recorded_response = _parsed_debug_event(events[1])
+        self.assertEqual(request_heading, "OpenAI REQUEST")
+        self.assertEqual(response_heading, "OpenAI RESPONSE")
+        self.assertEqual(request["phase"], "REQUEST")
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["url"], "https://api.openai.com/v1/responses")
+        self.assertEqual(request["attempt"], 1)
+        self.assertEqual(request["max_attempts"], 4)
+        payload = request["payload"]
+        transport_payload = transport.calls[0]["payload"]
+        assert transport_payload is not None
+        self.assertEqual(
+            {key: value for key, value in payload.items() if key != "input"},
+            {key: value for key, value in transport_payload.items() if key != "input"},
+        )
+        self.assertEqual(
+            json.loads(payload["input"]),
+            json.loads(transport_payload["input"]),
+        )
+        self.assertEqual(payload["model"], "gpt-debug")
+        self.assertIn(DEFAULT_TRANSLATION_PROMPT.split(". ", 1)[0], payload["instructions"])
+        self.assertIn(IMMUTABLE_TRANSLATION_PROTOCOL, payload["instructions"])
+        self.assertIn(JAPANESE_UNICODE_INSTRUCTIONS, payload["instructions"])
+        self.assertEqual(
+            json.loads(payload["input"]),
+            {
+                "items": [
+                    {
+                        "id": "u1",
+                        "response_key": "item_0000",
+                        "source_fragments": {"fragment_0000": "Full source text"},
+                        "source_token_order": [],
+                        "context": "quest title",
+                    }
+                ]
+            },
+        )
+        self.assertEqual(
+            payload["text"]["format"]["schema"]["properties"]["translations"][
+                "required"
+            ],
+            ["item_0000"],
+        )
+        self.assertEqual(recorded_response["phase"], "RESPONSE")
+        self.assertEqual(
+            {
+                key: value
+                for key, value in recorded_response["response"].items()
+                if key != "output_text"
+            },
+            {key: value for key, value in response.items() if key != "output_text"},
+        )
+        self.assertEqual(
+            json.loads(recorded_response["response"]["output_text"]),
+            json.loads(response["output_text"]),
+        )
+
+    def test_debug_response_is_recorded_before_translation_protocol_validation(self) -> None:
+        response = {
+            "id": "resp_debug_invalid_protocol",
+            "status": "completed",
+            "output_text": "not valid structured JSON",
+            "usage": {"total_tokens": 7},
+        }
+        events: list[str] = []
+
+        with self.assertRaises(OpenAIResponseProtocolError):
+            OpenAIClient(
+                transport=SequenceTransport(response),
+                on_debug=events.append,
+            ).translate_batch(
+                "sk-proj-protocol-debug-key-123456",
+                "gpt-debug",
+                [{"id": "u1", "text": "source", "context": "quest title"}],
+                "en_us",
+                "ja_jp",
+            )
+
+        self.assertEqual(
+            [_parsed_debug_event(message)[1]["phase"] for message in events],
+            ["REQUEST", "RESPONSE"],
+        )
+        heading, recorded = _parsed_debug_event(events[1])
+        self.assertEqual(heading, "OpenAI RESPONSE")
+        self.assertEqual(recorded["response"], response)
+
+    def test_debug_request_masks_confidential_fields_inside_json_input(self) -> None:
+        events: list[str] = []
+        response = _output_text(_plain_translation_payload(u1="翻訳"))
+        context_secret = "context-access-token-secret"
+
+        result = OpenAIClient(
+            transport=SequenceTransport(response),
+            on_debug=events.append,
+        ).translate_batch(
+            "sk-proj-json-input-key-123456",
+            "gpt-debug",
+            [
+                {
+                    "id": "u1",
+                    "text": "source",
+                    "context": {
+                        "access_token": context_secret,
+                        "safe_context": "quest description",
+                    },
+                }
+            ],
+            "en_us",
+            "ja_jp",
+        )
+
+        self.assertEqual(result, {"u1": "翻訳"})
+        self.assertNotIn(context_secret, "\n".join(events))
+        request = _parsed_debug_event(events[0])[1]
+        provider_input = json.loads(request["payload"]["input"])
+        self.assertEqual(
+            provider_input["items"][0]["context"],
+            {
+                "access_token": "[REDACTED]",
+                "safe_context": "quest description",
+            },
+        )
+
+    def test_debug_masks_confidential_fields_inside_prompt_and_response_json_text(
+        self,
+    ) -> None:
+        prompt_secret = "prompt-client-secret-value"
+        prompt_secret_second = "prompt-client-secret-second-value"
+        basic_secret = "dXNlcjpwYXNz"
+        cookie_secret = "session=one; refresh=two"
+        digest_secret = "Digest username=foo,response=bar"
+        response_secret = "response-access-token-value"
+        translated = f'翻訳 {{"access_token":"{response_secret}"}}'
+        events: list[str] = []
+        client = OpenAIClient(
+            transport=SequenceTransport(
+                _output_text(_plain_translation_payload(u1=translated))
+            ),
+            translation_prompt=(
+                "Translate {source_locale} to {target_locale}.\n"
+                "Private config: "
+                f'{{"client_secret":["{prompt_secret}",'
+                f'"{prompt_secret_second}"]}}\n'
+                f"Authorization: Basic {basic_secret}\n"
+                f"Cookie: {cookie_secret}\n"
+                f"Proxy-Authorization = {digest_secret}"
+            ),
+            on_debug=events.append,
+        )
+
+        result = client.translate_batch(
+            "key",
+            "gpt-debug",
+            [{"id": "u1", "text": "source", "context": "quest title"}],
+            "en_us",
+            "ja_jp",
+        )
+
+        # Sanitizing the debug copy must not alter data returned to the caller.
+        self.assertEqual(result, {"u1": translated})
+        combined = "\n".join(events)
+        for secret in (
+            prompt_secret,
+            prompt_secret_second,
+            basic_secret,
+            cookie_secret,
+            "refresh=two",
+            digest_secret,
+            "response=bar",
+            response_secret,
+        ):
+            self.assertNotIn(secret, combined)
+        self.assertGreaterEqual(combined.count("[REDACTED]"), 2)
+
+    def test_debug_preserves_duplicate_keys_inside_json_response_text(self) -> None:
+        response = {
+            "status": "completed",
+            "output_text": '{"duplicate":"first","duplicate":"second"}',
+        }
+        events: list[str] = []
+
+        with self.assertRaises(OpenAIResponseProtocolError):
+            OpenAIClient(
+                transport=SequenceTransport(response),
+                on_debug=events.append,
+            ).translate_batch(
+                "key",
+                "gpt-debug",
+                [{"id": "u1", "text": "source", "context": "quest title"}],
+                "en_us",
+                "ja_jp",
+            )
+
+        recorded = _parsed_debug_event(events[1])[1]
+        output_text = recorded["response"]["output_text"]
+        self.assertEqual(output_text.count('"duplicate"'), 2)
+
     def test_responses_payload_uses_strict_schema_and_nested_output(self) -> None:
         translated = {
             "translations": {
@@ -1653,6 +2107,7 @@ class OpenAIResponseTests(unittest.TestCase):
             {"data": []},
         )
         events: list[OpenAIRetryEvent] = []
+        debug_events: list[str] = []
 
         def cancel_retry(event: OpenAIRetryEvent) -> None:
             events.append(event)
@@ -1662,6 +2117,7 @@ class OpenAIResponseTests(unittest.TestCase):
             transport=transport,
             max_retries=3,
             on_retry=cancel_retry,
+            on_debug=debug_events.append,
         )
 
         with self.assertRaises(CancelledError):
@@ -1669,6 +2125,13 @@ class OpenAIResponseTests(unittest.TestCase):
 
         self.assertEqual(len(events), 1)
         self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(
+            [
+                _parsed_debug_event(message)[1]["phase"]
+                for message in debug_events
+            ],
+            ["REQUEST", "ERROR", "CANCELLED"],
+        )
 
     def test_only_explicit_transport_and_retryable_http_errors_are_retried(self) -> None:
         for status in (408, 409, 429, 500, 503):

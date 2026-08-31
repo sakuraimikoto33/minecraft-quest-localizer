@@ -27,10 +27,17 @@ class MinecraftLanguageBundle:
     source_provenance: str
     target_provenance: str
     warnings: tuple[str, ...] = ()
+    debug_messages: tuple[str, ...] = ()
 
 
 class _UniqueObject(dict[str, Any]):
     pass
+
+
+class _DuplicateJSONKeysError(ValueError):
+    def __init__(self, keys: tuple[str, ...]) -> None:
+        self.keys = keys
+        super().__init__(f"JSON keyが{len(keys)}件重複しています")
 
 
 def load_minecraft_language_bundle(
@@ -58,6 +65,7 @@ def load_minecraft_language_bundle(
     if not version:
         return None
     warnings: list[str] = []
+    debug_messages: list[str] = []
     saw_version_candidate = False
     source_only_fallback: tuple[dict[str, str], str] | None = None
     for root in _launcher_roots(instance_root):
@@ -77,6 +85,11 @@ def load_minecraft_language_bundle(
             _validate_client_jar(client_jar, metadata)
             source_from_client = _read_client_locale(client_jar, source_locale)
         except (OSError, UnicodeError, ValueError, zipfile.BadZipFile) as exc:
+            _record_duplicate_json_keys(
+                debug_messages,
+                exc,
+                f"Minecraft {version} 公式言語資産: {root}",
+            )
             warnings.append(
                 f"Minecraft {version} の公式言語資産を読めませんでした: "
                 f"{root} ({exc})"
@@ -92,6 +105,11 @@ def load_minecraft_language_bundle(
             _validate_asset_index(index_data, metadata)
             asset_index = _parse_json_object(index_data, index_path)
         except (OSError, UnicodeError, ValueError, zipfile.BadZipFile) as exc:
+            _record_duplicate_json_keys(
+                debug_messages,
+                exc,
+                f"Minecraft {version} asset index: {root}",
+            )
             if source_from_client is not None and source_only_fallback is None:
                 source_only_fallback = source_from_client
             preservation = (
@@ -116,6 +134,11 @@ def load_minecraft_language_bundle(
             else:
                 source_values, source_provenance = source_from_client
         except (OSError, UnicodeError, ValueError, zipfile.BadZipFile) as exc:
+            _record_duplicate_json_keys(
+                debug_messages,
+                exc,
+                f"Minecraft {version} 原文公式言語 {source_locale}: {root}",
+            )
             warnings.append(
                 f"Minecraft {version} の原文公式言語 {source_locale} を読めませんでした: "
                 f"{root} ({exc})"
@@ -130,6 +153,11 @@ def load_minecraft_language_bundle(
                 asset_observer,
             )
         except (OSError, UnicodeError, ValueError, zipfile.BadZipFile) as exc:
+            _record_duplicate_json_keys(
+                debug_messages,
+                exc,
+                f"Minecraft {version} 翻訳先公式言語 {target_locale}: {root}",
+            )
             warnings.append(
                 f"Minecraft {version} の翻訳先公式言語 {target_locale} を読めませんでした。"
                 f"検証済みの原文公式名は原語保護に利用します: {root} ({exc})"
@@ -152,9 +180,17 @@ def load_minecraft_language_bundle(
             source_provenance=source_provenance,
             target_provenance="",
             warnings=tuple(warnings),
+            debug_messages=tuple(debug_messages),
         )
     if saw_version_candidate and warnings:
-        return MinecraftLanguageBundle({}, {}, "", "", tuple(warnings))
+        return MinecraftLanguageBundle(
+            {},
+            {},
+            "",
+            "",
+            tuple(warnings),
+            tuple(debug_messages),
+        )
     return None
 
 
@@ -400,11 +436,36 @@ def _parse_language(data: bytes, label: str) -> dict[str, str]:
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> _UniqueObject:
     result = _UniqueObject()
+    duplicate_keys: set[str] = set()
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"JSON keyが重複しています: {key}")
+            duplicate_keys.add(key)
+            result.pop(key, None)
+            continue
+        if key in duplicate_keys:
+            continue
         result[key] = value
+    if duplicate_keys:
+        raise _DuplicateJSONKeysError(tuple(sorted(duplicate_keys)))
     return result
+
+
+def _record_duplicate_json_keys(
+    messages: list[str],
+    error: BaseException,
+    location: str,
+) -> None:
+    if not isinstance(error, _DuplicateJSONKeysError):
+        return
+    keys = "\n".join(
+        f"- {json.dumps(key, ensure_ascii=False)}" for key in error.keys
+    )
+    messages.append(
+        "重複JSONキー詳細\n"
+        f"資産: {location}\n"
+        f"件数: {len(error.keys)}\n"
+        f"キー:\n{keys}"
+    )
 
 
 def _read_limited_file(path: Path, maximum: int) -> bytes:

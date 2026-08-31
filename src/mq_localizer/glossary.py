@@ -286,6 +286,7 @@ class _SharedScanBudget:
     source_language_limit: int | None = _MAX_ARCHIVE_LANGUAGE_BYTES
     compressed_language_file_limit: int | None = _MAX_LANGUAGE_COMPRESSED_MEMBER_BYTES
     scan_limits: GlossaryScanLimits = field(default_factory=GlossaryScanLimits)
+    debug_messages: list[str] = field(default_factory=list)
 
     def reserve_language_bytes(self, amount: int) -> None:
         amount = max(0, amount)
@@ -527,6 +528,7 @@ class GlossaryCatalog:
     evidence: dict[str, tuple[GlossaryEntry, ...]] = field(default_factory=dict, repr=False)
     scanned_archives: int = 0
     warnings: list[str] = field(default_factory=list)
+    debug_messages: list[str] = field(default_factory=list, repr=False)
     discovered_archives: int = 0
     failed_archives: int = 0
     archives_with_warnings: int = 0
@@ -763,6 +765,7 @@ class GlossaryCatalog:
             evidence=self.evidence,
             scanned_archives=self.scanned_archives,
             warnings=self.warnings,
+            debug_messages=self.debug_messages,
             discovered_archives=self.discovered_archives,
             failed_archives=self.failed_archives,
             archives_with_warnings=self.archives_with_warnings,
@@ -851,6 +854,7 @@ class GlossaryCatalog:
             evidence=self.evidence,
             scanned_archives=self.scanned_archives,
             warnings=self.warnings,
+            debug_messages=self.debug_messages,
             discovered_archives=self.discovered_archives,
             failed_archives=self.failed_archives,
             archives_with_warnings=self.archives_with_warnings,
@@ -3052,6 +3056,7 @@ class ModLanguageScanner:
             if bundle is not None:
                 catalog.minecraft_asset_warning_count += len(bundle.warnings)
                 catalog.warnings.extend(bundle.warnings)
+                catalog.debug_messages.extend(bundle.debug_messages)
                 for entry in _minecraft_language_entries(
                     bundle,
                     cancel,
@@ -3098,6 +3103,7 @@ class ModLanguageScanner:
                 external_warned_sources.add(pending.container_label)
         catalog.archives_with_warnings = len(mod_warned_archives)
         catalog.external_sources_with_warnings = len(external_warned_sources)
+        catalog.debug_messages.extend(shared_budget.debug_messages)
         _resolve_glossary_evidence(catalog, prioritized_evidence, cancel)
         _raise_if_cancelled(cancel)
         catalog.input_snapshot = input_recorder.freeze()
@@ -3323,6 +3329,14 @@ class ModLanguageScanner:
                             parsed.duplicate_keys,
                         )
                     )
+                    if isinstance(scan_language_budget, _SharedScanBudget):
+                        scan_language_budget.debug_messages.append(
+                            _duplicate_language_key_debug_message(
+                                jar_path.name,
+                                name,
+                                parsed.duplicate_keys,
+                            )
+                        )
                 language_cache[name] = parsed
                 return parsed
 
@@ -5372,6 +5386,14 @@ def _read_external_language_inventory(
                     parsed.duplicate_keys,
                 )
             )
+            if isinstance(scan_language_budget, _SharedScanBudget):
+                scan_language_budget.debug_messages.append(
+                    _duplicate_language_key_debug_message(
+                        container_label,
+                        name,
+                        parsed.duplicate_keys,
+                    )
+                )
         language_cache[name] = parsed
         return parsed
 
@@ -5684,15 +5706,27 @@ def _duplicate_language_key_warning(
     language_name: str,
     duplicate_keys: tuple[str, ...],
 ) -> str:
-    preview_limit = 20
-    preview = ", ".join(_safe_warning_key(key) for key in duplicate_keys[:preview_limit])
-    omitted = len(duplicate_keys) - preview_limit
-    if omitted > 0:
-        preview += f" ほか{omitted}件"
     return (
         f"{jar_name}!/{language_name}: 言語keyが重複しているため、重複した"
-        f"{len(duplicate_keys)}件のkeyだけを除外しました: {preview}。"
+        f"{len(duplicate_keys)}件のkeyだけを除外しました。"
         "同じ言語ファイル内の他の用語は保護に利用します"
+    )
+
+
+def _duplicate_language_key_debug_message(
+    container_name: str,
+    language_name: str,
+    duplicate_keys: tuple[str, ...],
+) -> str:
+    rendered_keys = "\n".join(
+        f"- {json.dumps(key, ensure_ascii=False)}" for key in duplicate_keys
+    )
+    return (
+        "重複言語キー詳細\n"
+        f"資産: {container_name}\n"
+        f"言語ファイル: {language_name}\n"
+        f"件数: {len(duplicate_keys)}\n"
+        f"キー:\n{rendered_keys}"
     )
 
 

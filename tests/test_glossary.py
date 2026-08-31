@@ -688,20 +688,34 @@ class ModLanguageScannerTests(unittest.TestCase):
         self.assertTrue(all("重複" in warning for warning in catalog.warnings))
         self.assertTrue(all("だけを除外" in warning for warning in catalog.warnings))
         self.assertTrue(all("他の用語は保護に利用" in warning for warning in catalog.warnings))
-        self.assertTrue(any("_comment" in warning for warning in catalog.warnings))
-        self.assertTrue(any("item.jsondup.tool" in warning for warning in catalog.warnings))
-        self.assertTrue(any("item.langdup.tool" in warning for warning in catalog.warnings))
+        self.assertFalse(any("_comment" in warning for warning in catalog.warnings))
+        self.assertFalse(any("item.jsondup.tool" in warning for warning in catalog.warnings))
+        self.assertFalse(any("item.langdup.tool" in warning for warning in catalog.warnings))
+        details = "\n".join(catalog.debug_messages)
+        self.assertIn('"_comment"', details)
+        self.assertIn('"item.jsondup.tool"', details)
+        self.assertIn('"item.langdup.tool"', details)
 
-    def test_duplicate_key_warning_escapes_and_bounds_untrusted_keys(self) -> None:
+    def test_duplicate_key_summary_has_only_count_and_debug_has_every_key(self) -> None:
+        keys = ("line\nbreak", "x" * 10_000)
         warning = glossary_module._duplicate_language_key_warning(
             "example.jar",
             "assets/example/lang/en_us.json",
-            ("line\nbreak", "x" * 10_000),
+            keys,
+        )
+        detail = glossary_module._duplicate_language_key_debug_message(
+            "example.jar",
+            "assets/example/lang/en_us.json",
+            keys,
         )
 
         self.assertNotIn("\n", warning)
-        self.assertIn(r"line\nbreak", warning)
+        self.assertIn("重複した2件", warning)
+        self.assertNotIn(r"line\nbreak", warning)
+        self.assertNotIn("x" * 100, warning)
         self.assertLess(len(warning), 500)
+        self.assertIn(r"line\nbreak", detail)
+        self.assertIn("x" * 10_000, detail)
 
     def test_json_duplicate_detection_uses_decoded_keys_and_discards_all_occurrences(self) -> None:
         parsed = glossary_module._read_lang_bytes(
@@ -3159,6 +3173,74 @@ class ModLanguageScannerTests(unittest.TestCase):
         self.assertIn(r"\nforged-warning", warnings[0])
         self.assertLess(len(warnings[0]), 500)
 
+    def test_minecraft_duplicate_language_keys_use_count_only_warning_and_debug_details(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = Path(directory) / "launcher"
+            instance = launcher / "instances" / "Pack"
+            mods = instance / "mods"
+            mods.mkdir(parents=True)
+            _write_minecraft_assets(
+                launcher,
+                "1.20.1",
+                {"item.minecraft.iron_ingot": "Iron Ingot"},
+                {"item.minecraft.iron_ingot": "鉄インゴット"},
+            )
+            client = (
+                launcher
+                / "libraries"
+                / "com"
+                / "mojang"
+                / "minecraft"
+                / "1.20.1"
+                / "minecraft-1.20.1-client.jar"
+            )
+            _write_jar(
+                client,
+                {
+                    "assets/minecraft/lang/en_us.json": (
+                        '{"item.minecraft.iron_ingot":"Iron Ingot",'
+                        '"item.minecraft.first_duplicate":"First",'
+                        '"item.minecraft.first_duplicate":"Second",'
+                        '"block.minecraft.second_duplicate":"First",'
+                        '"block.minecraft.second_duplicate":"Second"}'
+                    )
+                },
+            )
+            _write_jar(
+                mods / "empty.jar",
+                {
+                    "fabric.mod.json": _json(
+                        {"schemaVersion": 1, "id": "empty", "name": "Empty"}
+                    )
+                },
+            )
+
+            with mock.patch.object(
+                minecraft_assets_module,
+                "_launcher_roots",
+                return_value=(launcher,),
+            ):
+                catalog = ModLanguageScanner().scan(
+                    mods,
+                    "en_us",
+                    "ja_jp",
+                    minecraft_version="1.20.1",
+                    instance_root=instance,
+                )
+
+        warnings = "\n".join(catalog.warnings)
+        debug_details = "\n".join(catalog.debug_messages)
+        self.assertIn("JSON keyが2件重複しています", warnings)
+        self.assertNotIn("item.minecraft.first_duplicate", warnings)
+        self.assertNotIn("block.minecraft.second_duplicate", warnings)
+        self.assertIn("重複JSONキー詳細", debug_details)
+        self.assertIn("件数: 2", debug_details)
+        self.assertIn('"item.minecraft.first_duplicate"', debug_details)
+        self.assertIn('"block.minecraft.second_duplicate"', debug_details)
+        self.assertEqual(catalog.coverage.minecraft_asset_warning_count, 1)
+
     def test_corrupt_minecraft_target_asset_warns_and_preserves_source_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             launcher = Path(directory) / "launcher"
@@ -4104,6 +4186,12 @@ class ModLanguageScannerTests(unittest.TestCase):
         self.assertEqual(catalog.external_sources_with_warnings, 1)
         self.assertEqual(catalog.external_asset_warning_count, 1)
         self.assertTrue(any("重複した1件のkeyだけを除外" in item for item in catalog.warnings))
+        self.assertFalse(
+            any("item.kubejs.duplicate" in item for item in catalog.warnings)
+        )
+        self.assertTrue(
+            any("item.kubejs.duplicate" in item for item in catalog.debug_messages)
+        )
 
     def test_external_assets_use_the_same_deterministic_conflict_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -53,6 +53,7 @@ class SettingsStoreTests(unittest.TestCase):
                     "model": "gpt-test",
                     "cached_models": [" gpt-new ", "gpt-new", "o3"],
                     "fast_mode": True,
+                    "debug_logging": True,
                     "translation_prompt": "   ",
                     "source_locale": ["not", "a", "string"],
                     "target_locale": "fr_fr",
@@ -76,6 +77,7 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(loaded.model, "gpt-test")
         self.assertEqual(loaded.cached_models, ["gpt-new", "o3"])
         self.assertTrue(loaded.fast_mode)
+        self.assertTrue(loaded.debug_logging)
         self.assertEqual(loaded.translation_prompt, DEFAULT_TRANSLATION_PROMPT)
         self.assertEqual(loaded.source_locale, "en_us")
         self.assertEqual(loaded.target_locale, "fr_fr")
@@ -96,6 +98,7 @@ class SettingsStoreTests(unittest.TestCase):
             model="gpt-test",
             cached_models=["gpt-new", "gpt-test"],
             fast_mode=True,
+            debug_logging=True,
             skip_glossary_confirmation=True,
             scan_resourcepacks=True,
             glossary_scan_limits_enabled=False,
@@ -114,6 +117,7 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(store.load(), settings)
         parsed = json.loads(store.path.read_text(encoding="utf-8"))
         self.assertNotIn("api_key", parsed)
+        self.assertIs(parsed["debug_logging"], True)
         self.assertIs(parsed["skip_glossary_confirmation"], True)
         self.assertIs(parsed["scan_resourcepacks"], True)
         self.assertIs(parsed["glossary_scan_limits_enabled"], False)
@@ -400,6 +404,34 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(loaded.model, "gpt-saved")
         self.assertEqual(loaded.cached_models, [])
         self.assertFalse(loaded.fast_mode)
+
+    def test_debug_logging_defaults_off_and_rejects_non_boolean_values(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+
+        self.assertFalse(AppSettings().debug_logging)
+        store.path.write_text(
+            json.dumps({"model": "gpt-saved", "debug_logging": True}),
+            encoding="utf-8",
+        )
+        self.assertTrue(store.load().debug_logging)
+
+        for invalid in (1, "true", None, [], {}):
+            with self.subTest(invalid=invalid):
+                store.path.write_text(
+                    json.dumps(
+                        {
+                            "model": "gpt-saved",
+                            "debug_logging": invalid,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                loaded = store.load()
+
+                self.assertEqual(loaded.model, "gpt-saved")
+                self.assertFalse(loaded.debug_logging)
 
     def test_selected_model_is_trimmed_when_loading_legacy_or_edited_settings(self) -> None:
         temporary, store = self.make_store()

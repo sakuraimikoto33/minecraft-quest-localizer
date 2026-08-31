@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import shutil
@@ -17,7 +18,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mq_localizer.categories import FTB_TRANSLATION_CATEGORIES  # noqa: E402
-from mq_localizer.analysis_log import SessionAnalysisLog  # noqa: E402
+from mq_localizer.analysis_log import (  # noqa: E402
+    SessionAnalysisLog,
+    SessionDebugLog,
+    SessionOpenAIJsonLog,
+)
 from mq_localizer.config import AppSettings, SettingsStore  # noqa: E402
 from mq_localizer.domain import (  # noqa: E402
     CancelledError,
@@ -255,6 +260,70 @@ class UiSecurityHelperTests(unittest.TestCase):
                 if expected_warning:
                     self.assertIn("有効化", shown.call_args.args[0])
                     self.assertIn("必ず有効化", shown.call_args.args[1])
+
+    def test_translated_event_does_not_append_analysis_warnings_again(self) -> None:
+        project = TranslationProject(
+            adapter_id="ftb_modern_snbt",
+            adapter_label="modern",
+            source_path=Path("source.snbt"),
+            default_output=Path("lang/ja_jp.snbt"),
+            source_locale="en_us",
+            target_locale="ja_jp",
+            units=[],
+            warnings=["project warning"],
+        )
+        analysis = SimpleNamespace(
+            analyzed=SimpleNamespace(project=project),
+            instance=SimpleNamespace(warnings=("instance warning",)),
+            glossary=GlossaryCatalog(warnings=["glossary warning"]),
+            scan_resourcepacks=False,
+            log_path=None,
+            log_error="",
+        )
+        outcome = TranslationOutcome(
+            output_path=project.default_output,
+            total=1,
+            translated=1,
+            reused=0,
+            copied_without_translation=0,
+            glossary_terms=0,
+        )
+        main = object.__new__(MainWindow)
+        main.events = Queue()
+        main.events.put(("translated", (outcome, analysis)))
+        main._drain_after_id = None
+        main.root = SimpleNamespace(  # type: ignore[assignment]
+            after=lambda _delay, _callback: "timer-id",
+            after_idle=lambda _callback: "idle-id",
+        )
+        main._set_detected_results = lambda _analysis: None  # type: ignore[method-assign]
+        main.progress_var = _FakeStringVar()  # type: ignore[assignment]
+        main.status_var = _FakeStringVar()  # type: ignore[assignment]
+        rendered: list[str] = []
+        main._render_durable_log_event = (  # type: ignore[method-assign]
+            lambda notice, *_args, **_kwargs: rendered.append(notice.message)
+        )
+        appended: list[str] = []
+        main._append_log = (  # type: ignore[method-assign]
+            lambda message, *_args, **_kwargs: appended.append(message)
+        )
+        main._report_session_log_error = lambda _error: None  # type: ignore[method-assign]
+        main._set_busy = lambda _busy: None  # type: ignore[method-assign]
+        main._save_settings = lambda: None  # type: ignore[method-assign]
+        main.close_pending = False
+
+        with (
+            patch("mq_localizer.ui.messagebox.showwarning") as showwarning,
+            patch("mq_localizer.ui.messagebox.showinfo") as showinfo,
+        ):
+            main._drain_events()
+
+        self.assertEqual(len(rendered), 1)
+        self.assertIn("翻訳完了", rendered[0])
+        self.assertEqual(appended, [])
+        showwarning.assert_not_called()
+        showinfo.assert_called_once()
+        self.assertIn("確認事項が 3 件", showinfo.call_args.args[1])
 
     def test_openai_retry_message_distinguishes_transport_reason_and_scope(self) -> None:
         message = _format_openai_retry(
@@ -1208,6 +1277,7 @@ class SettingsPromptTests(unittest.TestCase):
             dialog.api_key_var = _FakeStringVar("sk-current-key")  # type: ignore[assignment]
             dialog.model_var = _FakeStringVar("gpt-persisted")  # type: ignore[assignment]
             dialog.fast_mode_var = _FakeStringVar(True)  # type: ignore[assignment]
+            dialog.debug_logging_var = _FakeStringVar(True)  # type: ignore[assignment]
             dialog.batch_var = _FakeStringVar(24)  # type: ignore[assignment]
             dialog.char_limit_var = _FakeStringVar(9000)  # type: ignore[assignment]
             dialog.timeout_var = _FakeStringVar(120)  # type: ignore[assignment]
@@ -1247,6 +1317,7 @@ class SettingsPromptTests(unittest.TestCase):
             self.assertEqual(saved[0][1].model, "gpt-persisted")
             self.assertEqual(saved[0][1].cached_models, ["gpt-persisted", "o3"])
             self.assertTrue(saved[0][1].fast_mode)
+            self.assertTrue(saved[0][1].debug_logging)
             self.assertEqual(saved[0][1].max_retries, 0)
             self.assertEqual(saved[0][1].source_locale, "fr_fr")
             self.assertEqual(saved[0][1].target_locale, "de_de")
@@ -1267,6 +1338,7 @@ class SettingsPromptTests(unittest.TestCase):
             loaded = dialog.store.load()
             self.assertEqual(loaded.cached_models, ["gpt-persisted", "o3"])
             self.assertTrue(loaded.fast_mode)
+            self.assertTrue(loaded.debug_logging)
             self.assertEqual(loaded.max_retries, 0)
             self.assertEqual(loaded.source_locale, "fr_fr")
             self.assertEqual(loaded.target_locale, "de_de")
@@ -1542,12 +1614,18 @@ class SettingsPromptTests(unittest.TestCase):
         main.settings_summary_var = _FakeStringVar()  # type: ignore[assignment]
         logged: list[str] = []
         main._append_log = lambda message, **_kwargs: logged.append(message)  # type: ignore[method-assign]
+        main._glossary = GlossaryCatalog()
+        debug_logged: list[str] = []
+        main._write_debug_log = (  # type: ignore[method-assign]
+            lambda message, **_kwargs: debug_logged.append(message)
+        )
         invalidations: list[bool] = []
         main._invalidate_analysis = lambda: invalidations.append(True)  # type: ignore[method-assign]
         updated = AppSettings(
             model="gpt-persisted",
             cached_models=["gpt-persisted", "o3"],
             fast_mode=True,
+            debug_logging=True,
             source_locale="fr_fr",
             target_locale="de_de",
             preserve_existing=False,
@@ -1563,6 +1641,7 @@ class SettingsPromptTests(unittest.TestCase):
         self.assertEqual(main.settings.model, "gpt-persisted")
         self.assertEqual(main.settings.cached_models, ["gpt-persisted", "o3"])
         self.assertTrue(main.settings.fast_mode)
+        self.assertTrue(main.settings.debug_logging)
         self.assertFalse(main.settings.preserve_existing)
         self.assertTrue(main.settings.scan_resourcepacks)
         self.assertTrue(main.settings.skip_glossary_confirmation)
@@ -1572,6 +1651,7 @@ class SettingsPromptTests(unittest.TestCase):
         self.assertIn("resourcepacks走査: ON", main.settings_summary_var.get())
         self.assertIn("固有名詞保護の確認: 省略", main.settings_summary_var.get())
         self.assertIn("Fast Mode: ON", logged[0])
+        self.assertIn("デバッグログ: ON", logged[0])
         self.assertIn("locale: fr_fr → de_de", logged[0])
         self.assertIn("固有名詞保護の走査上限: 無効", logged[0])
 
@@ -1583,6 +1663,18 @@ class SettingsPromptTests(unittest.TestCase):
         self.assertEqual(invalidations, [True])
         self.assertTrue(main.settings.preserve_existing)
         self.assertFalse(main.settings.skip_glossary_confirmation)
+
+        debug_end_messages: list[str] = []
+        main.debug_log = SimpleNamespace(  # type: ignore[assignment]
+            write=lambda message, *_args, **_kwargs: debug_end_messages.append(message)
+        )
+        debug_only_change = _copy_settings(main.settings)
+        debug_only_change.debug_logging = False
+        main._settings_updated("new-key", debug_only_change)
+
+        self.assertEqual(invalidations, [True])
+        self.assertFalse(main.settings.debug_logging)
+        self.assertEqual(debug_end_messages, ["デバッグログを無効にしました。"])
 
 
 class WorkerCancellationTests(unittest.TestCase):
@@ -1729,8 +1821,17 @@ class WorkerCancellationTests(unittest.TestCase):
             ),
         )
         main.application = SimpleNamespace(analyze=lambda **_request: analyzed)  # type: ignore[assignment]
-        glossary = GlossaryCatalog(warnings=glossary_warnings)
+        glossary = GlossaryCatalog(
+            warnings=glossary_warnings,
+            debug_messages=["duplicate detail: item.example.tool"],
+        )
         main.scanner = SimpleNamespace(scan=lambda *_args, **_kwargs: glossary)  # type: ignore[assignment]
+        debug_events: list[tuple[str, str, str]] = []
+        main._write_debug_log = (  # type: ignore[method-assign]
+            lambda message, *, level, section: debug_events.append(
+                (message, level, section)
+            )
+        )
         captured: list[str] = []
         captured_metadata: list[dict[str, str]] = []
         expected_path = Path.cwd() / "logs" / "analysis-test.log"
@@ -1775,6 +1876,19 @@ class WorkerCancellationTests(unittest.TestCase):
         self.assertIn("下位候補で上位の訳を無効にしません", captured[0])
         self.assertIn("下位の値で上書きしません", captured[0])
         self.assertEqual(captured_metadata, [{"level": "INFO", "section": "解析結果全文"}])
+        self.assertEqual(len(debug_events), 2)
+        self.assertEqual(
+            debug_events[0],
+            (
+                "duplicate detail: item.example.tool",
+                "DEBUG",
+                "重複言語キー",
+            ),
+        )
+        self.assertEqual(
+            debug_events[1],
+            (captured[0], "INFO", "解析結果全文"),
+        )
 
     def test_request_accepts_only_an_instance_directory_and_locales(self) -> None:
         main = object.__new__(MainWindow)
@@ -1920,6 +2034,9 @@ class SessionJournalUiTests(unittest.TestCase):
         main._session_log_path = None
         main._session_log_errors = set()
         main._session_log_last_error = ""
+        main._debug_log_last_error = ""
+        main._openai_debug_log_path = None
+        main._openai_debug_log_last_error = ""
         main.detected_log_var = _FakeStringVar()  # type: ignore[assignment]
         inserted: list[tuple[str, str | None, bool]] = []
         main._insert_gui_log = (  # type: ignore[method-assign]
@@ -1928,6 +2045,136 @@ class SessionJournalUiTests(unittest.TestCase):
             )
         )
         return main, inserted
+
+    def test_debug_toggle_controls_lazy_file_and_mirrors_normal_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            main, _inserted = self.make_main(directory)
+            main.settings = AppSettings(debug_logging=False)
+            main.debug_log = SessionDebugLog(
+                Path(directory) / "logs",
+                process_id=456,
+            )
+            main.openai_debug_log = SessionOpenAIJsonLog(
+                Path(directory) / "logs",
+                process_id=456,
+            )
+
+            main._append_log("before debug", section="normal")
+            self.assertEqual(list((Path(directory) / "logs").glob("debug-*.log")), [])
+            self.assertEqual(list((Path(directory) / "logs").glob("openai-*.json")), [])
+
+            main.settings.debug_logging = True
+            main._append_log("while debug", section="normal")
+            self.assertEqual(list((Path(directory) / "logs").glob("openai-*.json")), [])
+            main._write_openai_debug(
+                "OpenAI RESPONSE\n"
+                + json.dumps(
+                    {
+                        "phase": "RESPONSE",
+                        "method": "POST",
+                        "response": {"output_text": "full response body"},
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+            debug_paths = list((Path(directory) / "logs").glob("debug-*.log"))
+            self.assertEqual(len(debug_paths), 1)
+            debug_text = debug_paths[0].read_text(encoding="utf-8")
+            self.assertNotIn("before debug", debug_text)
+            self.assertIn("while debug", debug_text)
+            self.assertNotIn("full response body", debug_text)
+            openai_paths = list((Path(directory) / "logs").glob("openai-*.json"))
+            self.assertEqual(len(openai_paths), 1)
+            openai_document = json.loads(openai_paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(
+                openai_document["events"][0]["response"]["output_text"],
+                "full response body",
+            )
+            openai_text = openai_paths[0].read_text(encoding="utf-8")
+
+            main.settings.debug_logging = False
+            main._append_log("after debug", section="normal")
+            main._write_openai_debug(
+                'OpenAI RESPONSE\n{"phase":"RESPONSE","response":"after debug"}'
+            )
+            self.assertEqual(
+                debug_paths[0].read_text(encoding="utf-8"),
+                debug_text,
+            )
+            self.assertEqual(
+                openai_paths[0].read_text(encoding="utf-8"),
+                openai_text,
+            )
+            assert main._session_log_path is not None
+            normal_text = main._session_log_path.read_text(encoding="utf-8")
+            self.assertIn("before debug", normal_text)
+            self.assertIn("while debug", normal_text)
+            self.assertIn("after debug", normal_text)
+
+    def test_debug_mirror_is_attempted_when_normal_journal_write_fails(self) -> None:
+        main = object.__new__(MainWindow)
+        mirrored: list[tuple[str, str, str]] = []
+
+        class FailingJournal:
+            def write(self, *_args: object, **_kwargs: object) -> Path:
+                raise OSError("normal journal failed")
+
+        main.analysis_log = FailingJournal()  # type: ignore[assignment]
+        main.session_api_key = "key"
+        main._write_debug_log = (  # type: ignore[method-assign]
+            lambda text, *, level, section: mirrored.append((text, level, section))
+        )
+
+        with self.assertRaisesRegex(OSError, "normal journal failed"):
+            main._write_session_log(
+                "event retained by debug",
+                level="WARNING",
+                section="test section",
+            )
+
+        self.assertEqual(
+            mirrored,
+            [("event retained by debug", "WARNING", "test section")],
+        )
+
+    def test_debug_write_failure_is_visible_in_log_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            main, _inserted = self.make_main(directory)
+            main.settings = AppSettings(debug_logging=True)
+            secret = main.session_api_key
+
+            class FailingDebugJournal:
+                def write(self, *_args: object, **_kwargs: object) -> Path:
+                    raise OSError(f"debug destination failed {secret}")
+
+            main.debug_log = FailingDebugJournal()  # type: ignore[assignment]
+            main._append_log("ordinary event")
+
+            status = main.detected_log_var.get()
+            self.assertIn("デバッグログを保存できませんでした", status)
+            self.assertNotIn(secret, status)
+            self.assertIn("[API KEY REDACTED]", status)
+
+    def test_openai_json_write_failure_is_visible_and_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            main, _inserted = self.make_main(directory)
+            main.settings = AppSettings(debug_logging=True)
+            secret = main.session_api_key
+
+            class FailingOpenAIJournal:
+                def write(self, *_args: object, **_kwargs: object) -> Path:
+                    raise OSError(f"OpenAI JSON destination failed {secret}")
+
+            main.openai_debug_log = FailingOpenAIJournal()  # type: ignore[assignment]
+            main._write_openai_debug(
+                'OpenAI REQUEST\n{"phase":"REQUEST","method":"POST"}'
+            )
+
+            status = main._session_log_status_text()
+            self.assertIn("OpenAI通信JSONを保存できませんでした", status)
+            self.assertNotIn(secret, status)
+            self.assertIn("[API KEY REDACTED]", status)
 
     def test_append_and_gui_replace_both_append_to_the_session_journal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2520,11 +2767,12 @@ class HighDpiLayoutTests(unittest.TestCase):
                 "sk-test-value",
                 store,
                 lambda _key, settings: dialog_saves.append(_copy_settings(settings)),
+                on_debug_log=lambda _message: None,
             )
             self.assertEqual(dialog.window.title(), "設定")
             self.assertEqual(
                 [dialog.notebook.tab(tab, "text") for tab in dialog.notebook.tabs()],
-                ["翻訳", "固有名詞保護", "OpenAI"],
+                ["翻訳", "固有名詞保護", "OpenAI", "ログ"],
             )
             dialog_widget_texts = [
                 str(widget.cget("text"))
@@ -2588,6 +2836,16 @@ class HighDpiLayoutTests(unittest.TestCase):
             )
             self.assertFalse(any("README" in text for text in dialog_widget_texts))
             self.assertIn("Fast Modeを使用", dialog_widget_texts)
+            self.assertIn("デバッグログを出力する", dialog_widget_texts)
+            self.assertTrue(
+                any(
+                    "OpenAIへの要求・応答全文" in text
+                    and "debug-*.log" in text
+                    and "openai-*.json" in text
+                    and "共有前に内容を確認" in text
+                    for text in dialog_widget_texts
+                )
+            )
             self.assertIn("再試行回数（初回を除く）", dialog_widget_texts)
             locale_combos = [
                 widget
@@ -2608,6 +2866,7 @@ class HighDpiLayoutTests(unittest.TestCase):
                 )
             )
             self.assertEqual(dialog.retry_var.get(), 3)
+            self.assertFalse(dialog.debug_logging_var.get())
             self.assertTrue(dialog.glossary_scan_limits_enabled_var.get())
             self.assertEqual(dialog.glossary_max_source_members_var.get(), 100_000)
             self.assertEqual(dialog.glossary_max_language_file_mib_var.get(), 16)
@@ -2652,6 +2911,7 @@ class HighDpiLayoutTests(unittest.TestCase):
                 (dialog.translation_tab, dialog.translation_scroll_pane),
                 (dialog.glossary_tab, dialog.glossary_scroll_pane),
                 (dialog.openai_tab, dialog.openai_scroll_pane),
+                (dialog.logging_tab, dialog.logging_scroll_pane),
             ):
                 dialog.notebook.select(tab)
                 dialog.window.update()
@@ -2712,6 +2972,7 @@ class HighDpiLayoutTests(unittest.TestCase):
             self.assertEqual(observed_client_options[0]["timeout"], 120)
             self.assertEqual(observed_client_options[0]["max_retries"], 3)
             self.assertTrue(callable(observed_client_options[0]["on_retry"]))
+            self.assertIsNone(observed_client_options[0]["on_debug"])
             dialog.source_locale_var.set("fr_fr")
             dialog.preserve_var.set(False)
             dialog.scan_resourcepacks_var.set(True)

@@ -39,6 +39,7 @@ class AppSettings:
     model: str = ""
     cached_models: list[str] = field(default_factory=list)
     fast_mode: bool = False
+    debug_logging: bool = False
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT
     source_locale: str = "en_us"
     target_locale: str = "ja_jp"
@@ -239,6 +240,7 @@ def _validated_settings(raw: dict[str, Any]) -> AppSettings:
         "preserve_existing",
         "save_api_key",
         "fast_mode",
+        "debug_logging",
         "skip_glossary_confirmation",
         "scan_resourcepacks",
     ):

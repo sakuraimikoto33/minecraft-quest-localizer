@@ -14,7 +14,12 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .analysis_log import SessionAnalysisLog, redact_sensitive
+from .analysis_log import (
+    SessionAnalysisLog,
+    SessionDebugLog,
+    SessionOpenAIJsonLog,
+    redact_sensitive,
+)
 from .application import AnalyzedProject, LocalizerApplication
 from .categories import FTB_TRANSLATION_CATEGORIES
 from .config import AppSettings, MAX_CACHED_MODEL_COUNT, SettingsStore
@@ -1061,9 +1066,22 @@ class MainWindow:
         self.store = SettingsStore()
         self.settings = self.store.load()
         self.analysis_log = SessionAnalysisLog(self.store.path.parent / "logs")
+        self.debug_log = SessionDebugLog(
+            self.analysis_log.directory,
+            session_started=self.analysis_log.session_started,
+            process_id=self.analysis_log.process_id,
+        )
+        self.openai_debug_log = SessionOpenAIJsonLog(
+            self.analysis_log.directory,
+            session_started=self.analysis_log.session_started,
+            process_id=self.analysis_log.process_id,
+        )
         self._session_log_path: Path | None = None
+        self._openai_debug_log_path: Path | None = None
         self._session_log_errors: set[str] = set()
         self._session_log_last_error = ""
+        self._debug_log_last_error = ""
+        self._openai_debug_log_last_error = ""
         self.session_api_key = self.store.read_api_key(self.settings)
         self.application = LocalizerApplication()
         self.scanner = ModLanguageScanner()
@@ -1474,6 +1492,12 @@ class MainWindow:
         )
         if self.cancel_event.is_set():
             raise CancelledError("処理をキャンセルしました")
+        for debug_message in glossary.debug_messages:
+            self._write_debug_log(
+                debug_message,
+                level="DEBUG",
+                section="重複言語キー",
+            )
         analysis = _InstanceAnalysis(
             analyzed=analyzed,
             instance=instance,
@@ -1536,6 +1560,7 @@ class MainWindow:
         batch_char_limit = self.settings.batch_char_limit
         translation_prompt = self.settings.translation_prompt
         fast_mode = self.settings.fast_mode
+        debug_logging = self.settings.debug_logging
 
         selected_labels = [
             category.label
@@ -1706,6 +1731,7 @@ class MainWindow:
                 max_retries=max_retries,
                 translation_prompt=translation_prompt,
                 on_retry=self._queue_openai_retry,
+                on_debug=self._write_openai_debug if debug_logging else None,
             )
             service = TranslationService(client, fast_mode=fast_mode)
 
@@ -2099,11 +2125,14 @@ class MainWindow:
                     self._glossary = analysis.glossary
                     self._analysis_scan_resourcepacks = analysis.scan_resourcepacks
                     self._set_detected_results(analysis)
-                    warnings = [
-                        *analysis.instance.warnings,
-                        *analysis.analyzed.project.warnings,
-                        *analysis.glossary.warnings,
-                    ]
+                    warning_count = sum(
+                        len(group)
+                        for group in (
+                            analysis.instance.warnings,
+                            analysis.analyzed.project.warnings,
+                            analysis.glossary.warnings,
+                        )
+                    )
                     self.progress_var.set(100)
                     self.status_var.set("翻訳が完了しました")
                     self._render_durable_log_event(
@@ -2111,14 +2140,6 @@ class MainWindow:
                         "ok",
                         section="翻訳完了",
                     )
-                    warning_block = _format_warning_block(
-                        warnings,
-                        full_log_path=analysis.log_path,
-                    )
-                    if warning_block:
-                        # The uncapped warnings were already written as the
-                        # pre-translation analysis event by the worker.
-                        self._append_log(warning_block, "warning", persist=False)
                     if analysis.log_error:
                         self._report_session_log_error(analysis.log_error)
                     self._set_busy(False)
@@ -2126,7 +2147,7 @@ class MainWindow:
                     if not self.close_pending:
                         project = analysis.analyzed.project
                         dialog_kind, dialog_title, dialog_message = (
-                            _translation_completion_dialog(project, len(warnings))
+                            _translation_completion_dialog(project, warning_count)
                         )
                         if dialog_kind == "warning":
                             messagebox.showwarning(dialog_title, dialog_message)
@@ -2335,10 +2356,12 @@ class MainWindow:
             lambda api_key, settings: self._settings_updated(api_key, settings),
             show_settings_log,
             self._persist_worker_log,
+            self._write_openai_debug if self.settings.debug_logging else None,
             initial_tab=initial_tab,
         )
 
     def _settings_updated(self, api_key: str, settings: AppSettings) -> None:
+        debug_was_enabled = self.settings.debug_logging
         previous_analysis_options = (
             self.settings.source_locale,
             self.settings.target_locale,
@@ -2347,6 +2370,23 @@ class MainWindow:
         )
         self.session_api_key = api_key
         self.settings = _copy_settings(settings)
+        if debug_was_enabled and not self.settings.debug_logging:
+            # Record the end of the opt-in interval before subsequent debug
+            # events are suppressed.
+            debug_log = getattr(self, "debug_log", None)
+            if debug_log is not None:
+                try:
+                    debug_log.write(
+                        "デバッグログを無効にしました。",
+                        self.session_api_key,
+                        level="INFO",
+                        section="設定更新",
+                    )
+                except OSError as exc:
+                    self._debug_log_last_error = _redact_sensitive(
+                        str(exc),
+                        self.session_api_key,
+                    )
         settings_summary_var = getattr(self, "settings_summary_var", None)
         if settings_summary_var is not None:
             settings_summary_var.set(_settings_summary_text(self.settings))
@@ -2362,28 +2402,49 @@ class MainWindow:
         reuse = "ON" if settings.preserve_existing else "OFF"
         resourcepacks = "ON" if settings.scan_resourcepacks else "OFF"
         confirmation = "省略" if settings.skip_glossary_confirmation else "表示"
+        debug_logging = "ON" if settings.debug_logging else "OFF"
         self._append_log(
             f"設定を更新しました（locale: {settings.source_locale} → {settings.target_locale}、"
             f"既存翻訳の再利用: {reuse}、resourcepacks走査: {resourcepacks}、"
             f"固有名詞保護の確認: {confirmation}、モデル: {settings.model or '未選択'}、"
             f"Fast Mode: {mode}、timeout: {settings.request_timeout}秒、"
             f"通信再試行: {settings.max_retries}回、固有名詞保護の走査上限: "
-            f"{_glossary_scan_limits_summary(settings.glossary_scan_limits)}）。",
+            f"{_glossary_scan_limits_summary(settings.glossary_scan_limits)}、"
+            f"デバッグログ: {debug_logging}）。",
             section="設定更新",
         )
+        if not debug_was_enabled and self.settings.debug_logging:
+            glossary = getattr(self, "_glossary", None)
+            for debug_message in getattr(glossary, "debug_messages", ()):
+                self._write_debug_log(
+                    debug_message,
+                    level="DEBUG",
+                    section="重複言語キー（解析済み）",
+                )
 
     def _session_log_status_text(self) -> str:
         path = getattr(self, "_session_log_path", None)
         error = getattr(self, "_session_log_last_error", "")
+        debug_error = getattr(self, "_debug_log_last_error", "")
+        openai_path = getattr(self, "_openai_debug_log_path", None)
+        openai_error = getattr(self, "_openai_debug_log_last_error", "")
         if path is not None and error:
-            return f"{path}\n一部のログを保存できませんでした: {error}"
-        if path is not None:
-            return str(path)
-        if error:
-            return f"保存できませんでした: {error}"
-        analysis_log = getattr(self, "analysis_log", None)
-        directory = getattr(analysis_log, "directory", "保存先不明")
-        return f"未作成（{directory}）"
+            status = f"{path}\n一部のログを保存できませんでした: {error}"
+        elif path is not None:
+            status = str(path)
+        elif error:
+            status = f"保存できませんでした: {error}"
+        else:
+            analysis_log = getattr(self, "analysis_log", None)
+            directory = getattr(analysis_log, "directory", "保存先不明")
+            status = f"未作成（{directory}）"
+        if debug_error:
+            status += f"\nデバッグログを保存できませんでした: {debug_error}"
+        if openai_path is not None:
+            status += f"\nOpenAI通信JSON: {openai_path}"
+        if openai_error:
+            status += f"\nOpenAI通信JSONを保存できませんでした: {openai_error}"
+        return status
 
     @staticmethod
     def _log_level(tag: str | None) -> str:
@@ -2404,15 +2465,75 @@ class MainWindow:
 
         analysis_log = getattr(self, "analysis_log", None)
         if analysis_log is None:
+            self._write_debug_log(text, level=level, section=section)
             return None
-        path = analysis_log.write(
-            text,
-            getattr(self, "session_api_key", ""),
-            level=level,
-            section=section,
-        )
-        self._session_log_path = path
-        return path
+        try:
+            path = analysis_log.write(
+                text,
+                getattr(self, "session_api_key", ""),
+                level=level,
+                section=section,
+            )
+            self._session_log_path = path
+            return path
+        finally:
+            # Keep the opt-in diagnostic stream useful even if the ordinary
+            # session-log destination has a transient write failure.
+            self._write_debug_log(text, level=level, section=section)
+
+    def _write_debug_log(
+        self,
+        text: str,
+        *,
+        level: str = "DEBUG",
+        section: str = "詳細診断",
+    ) -> Path | None:
+        """Write only while the opt-in toggle is enabled; never disrupt work."""
+
+        settings = getattr(self, "settings", None)
+        if settings is None or not getattr(settings, "debug_logging", False):
+            return None
+        debug_log = getattr(self, "debug_log", None)
+        if debug_log is None:
+            return None
+        try:
+            return debug_log.write(
+                text,
+                getattr(self, "session_api_key", ""),
+                level=level,
+                section=section,
+            )
+        except OSError as exc:
+            # A diagnostic feature must not change analysis, translation, or
+            # retry behavior.  Retain a sanitized status for later inspection.
+            self._debug_log_last_error = _redact_sensitive(
+                str(exc),
+                getattr(self, "session_api_key", ""),
+            )
+            return None
+
+    def _write_openai_debug(self, message: str) -> None:
+        """Persist a sanitized OpenAI callback as structured JSON only."""
+
+        settings = getattr(self, "settings", None)
+        if settings is None or not getattr(settings, "debug_logging", False):
+            return
+        openai_log = getattr(self, "openai_debug_log", None)
+        if openai_log is None:
+            return
+        try:
+            self._openai_debug_log_path = openai_log.write(
+                message,
+                getattr(self, "session_api_key", ""),
+            )
+        except Exception as exc:
+            # OpenAIClient deliberately isolates debug callback failures. Keep
+            # a sanitized status here so malformed or unwritable JSON is not
+            # silently lost while translation itself continues safely.
+            self._openai_debug_log_last_error = _redact_sensitive(
+                str(exc),
+                getattr(self, "session_api_key", ""),
+            )
 
     def _persist_worker_log(
         self,
@@ -2691,6 +2812,7 @@ class SettingsDialog:
         on_save: Callable[[str, AppSettings], None],
         on_log: Callable[..., None] | None = None,
         on_durable_log: Callable[..., _DurableLogEvent] | None = None,
+        on_debug_log: Callable[[str], None] | None = None,
         *,
         initial_tab: str = "translation",
     ) -> None:
@@ -2702,6 +2824,7 @@ class SettingsDialog:
         self.on_save = on_save
         self.on_log = on_log
         self.on_durable_log = on_durable_log
+        self.on_debug_log = on_debug_log
         self.window = tk.Toplevel(parent)
         self.window.withdraw()
         self.window.title("設定")
@@ -2754,6 +2877,7 @@ class SettingsDialog:
         )
         self.model_var = tk.StringVar(value=settings.model)
         self.fast_mode_var = tk.BooleanVar(value=settings.fast_mode)
+        self.debug_logging_var = tk.BooleanVar(value=settings.debug_logging)
         self.batch_var = tk.IntVar(value=settings.batch_size)
         self.char_limit_var = tk.IntVar(value=settings.batch_char_limit)
         self.timeout_var = tk.IntVar(value=settings.request_timeout)
@@ -2790,9 +2914,11 @@ class SettingsDialog:
         self.translation_tab = ttk.Frame(self.notebook)
         self.glossary_tab = ttk.Frame(self.notebook)
         self.openai_tab = ttk.Frame(self.notebook)
+        self.logging_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.translation_tab, text="翻訳")
         self.notebook.add(self.glossary_tab, text="固有名詞保護")
         self.notebook.add(self.openai_tab, text="OpenAI")
+        self.notebook.add(self.logging_tab, text="ログ")
 
         self.translation_scroll_pane = _ScrollablePane(
             self.translation_tab,
@@ -2809,10 +2935,16 @@ class SettingsDialog:
             padding=18,
             wheel_master=self.window,
         )
+        self.logging_scroll_pane = _ScrollablePane(
+            self.logging_tab,
+            padding=18,
+            wheel_master=self.window,
+        )
         self.tab_scroll_panes = {
             "translation": self.translation_scroll_pane,
             "glossary": self.glossary_scroll_pane,
             "openai": self.openai_scroll_pane,
+            "logging": self.logging_scroll_pane,
         }
         for pane in self.tab_scroll_panes.values():
             pane.pack(fill="both", expand=True)
@@ -2823,6 +2955,7 @@ class SettingsDialog:
         self._build_translation_tab(self.translation_scroll_pane.content)
         self._build_glossary_tab(self.glossary_scroll_pane.content)
         self._build_openai_tab(self.openai_scroll_pane.content)
+        self._build_logging_tab(self.logging_scroll_pane.content)
 
         buttons = ttk.Frame(self.window, padding=(14, 0, 14, 14))
         buttons.grid(row=1, column=0, sticky="e")
@@ -2841,6 +2974,7 @@ class SettingsDialog:
             "translation": getattr(self, "translation_tab", None),
             "glossary": getattr(self, "glossary_tab", None),
             "openai": getattr(self, "openai_tab", None),
+            "logging": getattr(self, "logging_tab", None),
         }.get(tab_name)
         if notebook is not None and tab is not None:
             notebook.select(tab)
@@ -3253,6 +3387,40 @@ class SettingsDialog:
             row=6, column=0, columnspan=2, sticky="w", pady=(8, 14)
         )
 
+    def _build_logging_tab(self, frame: ttk.Frame) -> None:
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            frame,
+            text="デバッグログ",
+            font=("Yu Gothic UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        self.debug_logging_check = ttk.Checkbutton(
+            frame,
+            text="デバッグログを出力する",
+            variable=self.debug_logging_var,
+        )
+        self.debug_logging_check.grid(row=1, column=0, sticky="w")
+        self.debug_logging_help = ttk.Label(
+            frame,
+            text=(
+                "有効な間、重複言語キーなどの詳細をdebug-*.logへ、OpenAIへの"
+                "要求・応答全文をopenai-*.jsonへ記録します。どちらもlogsフォルダー"
+                "内に作成します。\n"
+                "APIキーや既知の認証情報はマスクしますが、クエスト本文、翻訳結果、"
+                "カスタムプロンプトは記録されます。共有前に内容を確認してください。"
+            ),
+            foreground="#4b5563",
+            justify="left",
+            wraplength=650,
+        )
+        self.debug_logging_help.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            padx=(24, 0),
+            pady=(4, 0),
+        )
+
     def _fetch_models(self) -> None:
         api_key = self.api_key_var.get().strip()
         if not api_key:
@@ -3285,6 +3453,11 @@ class SettingsDialog:
                     timeout=timeout,
                     max_retries=max_retries,
                     on_retry=lambda event: self._queue_model_retry(event, api_key),
+                    on_debug=(
+                        getattr(self, "on_debug_log", None)
+                        if self.settings.debug_logging
+                        else None
+                    ),
                 )
                 models = client.list_models(api_key, cancel_event)
                 self.model_events.put(("loaded", (api_key, models)))
@@ -3652,6 +3825,9 @@ class SettingsDialog:
             self.settings.model = model
             self.settings.cached_models = list(self.models)
             self.settings.fast_mode = bool(self.fast_mode_var.get())
+            self.settings.debug_logging = bool(
+                value("debug_logging_var", self.settings.debug_logging)
+            )
             self.settings.translation_prompt = translation_prompt
             self.settings.batch_size = batch_size
             self.settings.batch_char_limit = char_limit
