@@ -8,7 +8,7 @@ MinecraftのModpackで使われるFTB Questsを、OpenAI APIで翻訳するロ�
 
 ## 必要なもの
 
-- Python 3.11以降（外部Pythonパッケージは不要）
+- ソースから起動する場合はPython 3.11以降（外部Pythonパッケージは不要）
 - OpenAI APIキー
 
 解析はAPIキーなしでも実行できますが、翻訳開始にはOpenAI APIキーと使用モデルの選択が必要です。API利用料金はOpenAIのアカウントと選択モデルに依存します。
@@ -27,7 +27,9 @@ MinecraftのModpackで使われるFTB Questsを、OpenAI APIで翻訳するロ�
 
 ## 起動
 
-Windowsではリポジトリ直下の `launch.pyw` をダブルクリックします。コンソールから起動する場合:
+Windows x64では、Releasesから `MinecraftQuestLocalizer-*-windows-x64.exe` をダウンロードして起動できます。
+
+ソースから起動する場合は、リポジトリ直下の `launch.pyw` をダブルクリックします。コンソールから起動する場合:
 
 ```powershell
 py -3.11 launch.pyw

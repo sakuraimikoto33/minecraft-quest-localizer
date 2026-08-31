@@ -28,6 +28,8 @@ py -3.11 -B -m unittest discover -s tests -v
 
 テストはSNBT / JSON5構文、世代別アダプター、原文hash不変、選択外項目の除外、装飾・改行・placeholder、Mod / Minecraft / KubeJS / resource pack用語、OpenAIモック、raw JSON、出力path検証、atomic write / rollbackを対象にします。実際のOpenAI APIを呼ぶテストは含みません。
 
+Windows x64の単一EXEとGitHub Releaseの条件は[Windows単一ファイルのビルドとRelease](release.md)を参照してください。
+
 ## 参考資料
 
 - [FTB Quests公式リポジトリ / CHANGELOG](https://github.com/FTBTeam/FTB-Quests/blob/main/CHANGELOG.md)

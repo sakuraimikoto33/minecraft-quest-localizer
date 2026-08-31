@@ -1,0 +1,249 @@
+name: Package Windows application
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "src/**"
+      - "launch.pyw"
+      - "pyproject.toml"
+      - ".github/scripts/release_plan.py"
+      - ".github/scripts/test_release_plan.py"
+      - ".github/workflows/package-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  PACKAGING_VERSION: "26.3"
+  PYINSTALLER_VERSION: "6.22.2"
+
+jobs:
+  plan:
+    name: Plan build and release
+    runs-on: ubuntu-latest
+    outputs:
+      build_required: ${{ steps.plan.outputs.build_required }}
+      release_required: ${{ steps.plan.outputs.release_required }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      asset_name: ${{ steps.plan.outputs.asset_name }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      tag_exists: ${{ steps.plan.outputs.tag_exists }}
+    steps:
+      - name: Check out the complete repository history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the version parser
+        run: python -m pip install --disable-pip-version-check "packaging==${PACKAGING_VERSION}"
+
+      - name: Test the release planner
+        run: python .github/scripts/test_release_plan.py
+
+      - name: Read every GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh api --paginate --slurp
+          -H "Accept: application/vnd.github+json"
+          -H "X-GitHub-Api-Version: 2022-11-28"
+          "repos/${GITHUB_REPOSITORY}/releases?per_page=100"
+          > "${RUNNER_TEMP}/releases.json"
+
+      - name: Decide whether to build and release
+        id: plan
+        run: >-
+          python .github/scripts/release_plan.py
+          --repository .
+          --head "${GITHUB_SHA}"
+          --releases-json "${RUNNER_TEMP}/releases.json"
+          --github-output "${GITHUB_OUTPUT}"
+          --step-summary "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    name: Build Windows x64 executable
+    needs: plan
+    if: needs.plan.outputs.build_required == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+
+      - name: Install PyInstaller
+        run: >-
+          python -m pip install --disable-pip-version-check
+          "pyinstaller==${env:PYINSTALLER_VERSION}"
+
+      - name: Run application tests
+        run: python -B -m unittest discover -s tests
+
+      - name: Build the single-file GUI application
+        run: >-
+          python -m PyInstaller
+          --noconfirm
+          --clean
+          --onefile
+          --windowed
+          --name MinecraftQuestLocalizer
+          --paths src
+          --distpath dist
+          --workpath "${env:RUNNER_TEMP}/mq-localizer-pyinstaller"
+          --specpath "${env:RUNNER_TEMP}"
+          launch.pyw
+
+      - name: Verify and version the executable
+        env:
+          ASSET_NAME: ${{ needs.plan.outputs.asset_name }}
+        shell: pwsh
+        run: |
+          $source = Join-Path $PWD "dist/MinecraftQuestLocalizer.exe"
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "PyInstaller did not create $source"
+          }
+          if ((Get-Item -LiteralPath $source).Length -le 0) {
+            throw "PyInstaller created an empty executable"
+          }
+          $beforeRename = @(Get-ChildItem -LiteralPath (Join-Path $PWD "dist") -Force)
+          if ($beforeRename.Count -ne 1) {
+            throw "The dist directory must contain exactly one entry"
+          }
+          $destination = Join-Path $PWD ("dist/" + $env:ASSET_NAME)
+          Move-Item -LiteralPath $source -Destination $destination
+          $afterRename = @(Get-ChildItem -LiteralPath (Join-Path $PWD "dist") -Force)
+          if ($afterRename.Count -ne 1 -or $afterRename[0].FullName -ne $destination) {
+            throw "The versioned dist directory is not a single-file package"
+          }
+          $digest = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+          "### Windows package" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- File: ``$env:ASSET_NAME``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- SHA-256: ``$digest``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload the single executable
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          path: dist/${{ needs.plan.outputs.asset_name }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - plan
+      - build
+    if: >-
+      needs.plan.outputs.release_required == 'true' &&
+      github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the complete repository history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the version parser
+        run: python -m pip install --disable-pip-version-check "packaging==${PACKAGING_VERSION}"
+
+      - name: Download the verified executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.plan.outputs.asset_name }}
+          path: dist
+
+      - name: Refresh every GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh api --paginate --slurp
+          -H "Accept: application/vnd.github+json"
+          -H "X-GitHub-Api-Version: 2022-11-28"
+          "repos/${GITHUB_REPOSITORY}/releases?per_page=100"
+          > "${RUNNER_TEMP}/releases.json"
+
+      - name: Recheck the release gate
+        id: recheck
+        run: >-
+          python .github/scripts/release_plan.py
+          --repository .
+          --head "${GITHUB_SHA}"
+          --releases-json "${RUNNER_TEMP}/releases.json"
+          --github-output "${GITHUB_OUTPUT}"
+          --step-summary "${GITHUB_STEP_SUMMARY}"
+
+      - name: Claim the tag and publish the versioned Release
+        if: steps.recheck.outputs.release_required == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSET_NAME: ${{ needs.plan.outputs.asset_name }}
+          VERSION: ${{ steps.recheck.outputs.version }}
+          RELEASE_TAG: ${{ steps.recheck.outputs.tag }}
+          PRERELEASE: ${{ steps.recheck.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="dist/${ASSET_NAME}"
+          test -f "$asset"
+
+          ref="refs/tags/${RELEASE_TAG}"
+          if ! git show-ref --verify --quiet "$ref"; then
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
+          fi
+
+          tag_target=$(git rev-parse --verify "${ref}^{commit}")
+          if [[ "$tag_target" != "$GITHUB_SHA" ]]; then
+            echo "Release tag $RELEASE_TAG points to $tag_target, not $GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          git push origin "${ref}:${ref}"
+
+          local_object=$(git rev-parse --verify "$ref")
+          remote_ref=$(git ls-remote --refs origin "$ref")
+          expected_ref="${local_object}"$'\t'"${ref}"
+          if [[ "$remote_ref" != "$expected_ref" ]]; then
+            echo "Remote Release tag changed while it was being verified" >&2
+            exit 1
+          fi
+
+          arguments=(
+            release create "$RELEASE_TAG" "$asset"
+            --repo "$GITHUB_REPOSITORY"
+            --title "Minecraft Quest Localizer ${VERSION}"
+            --generate-notes
+            --fail-on-no-commits
+            --verify-tag
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            arguments+=(--prerelease)
+          fi
+
+          gh "${arguments[@]}"

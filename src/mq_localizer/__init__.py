@@ -3,4 +3,4 @@
 from .domain import TranslationProject, TranslationUnit
 
 __all__ = ["TranslationProject", "TranslationUnit"]
-__version__ = "0.1.0"
+__version__ = "1.0.0"
