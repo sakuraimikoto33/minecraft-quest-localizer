@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minecraft-quest-localizer"
-version = "1.0.1"
+version = "1.0.2"
 description = "OpenAI-powered, non-destructive localizer for Minecraft quest data"
 readme = "README.md"
 requires-python = ">=3.11"
