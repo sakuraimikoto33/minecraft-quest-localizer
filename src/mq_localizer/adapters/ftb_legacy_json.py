@@ -31,6 +31,7 @@ _MAX_QUEST_REFERENCE_FILE_BYTES = 16 * 1024 * 1024
 _MAX_QUEST_REFERENCE_FILES = 20_000
 _MAX_RESOURCE_ID_LENGTH = 512
 _RESOURCE_ID = re.compile(r"[a-z0-9_.-]+:[a-z0-9_./-]+")
+_QUEST_REFERENCE_PREFIXES = ("quest.", "quests.")
 _RESOURCE_FIELDS = frozenset({"block", "entity", "fluid", "item"})
 # Item Filters stores a selector object in the task's ``item`` field.  Its own
 # registry ID describes the selector implementation, not the item or tag named
@@ -249,10 +250,17 @@ def _quest_catalog_confidence(
         isinstance(key, str) and isinstance(value, str) for key, value in parsed.items()
     ):
         return path_confidence
-    if quest_references.intersection(parsed):
+    matching_references = quest_references.intersection(parsed)
+    if matching_references:
         # A key referenced by this instance's FTB quest data is stronger than
         # directory naming and lets a root-only UI select a KubeJS catalog
-        # even while the already-keyed raw quest files still exist.
+        # even while the already-keyed raw quest files still exist.  Keep
+        # quest-shaped text references separate from ordinary item/material
+        # keys used by task titles: the latter identify terminology, not the
+        # quest catalog.  Equal authored catalogs remain ambiguous instead of
+        # silently selecting the larger half of a split catalog.
+        if any(_looks_like_quest_reference(key) for key in matching_references):
+            return 4
         return 3
     # One generic ``quest.*.title`` key is common in non-FTB UI language
     # catalogs and is not sufficient evidence during recursive auto-detect.
@@ -260,6 +268,13 @@ def _quest_catalog_confidence(
     # stronger FTB-specific source or raw quest book competes with it.
     categorized = sum(classify_ftb_text(key) != "other" for key in parsed)
     return max(path_confidence, 1 if categorized >= 2 else 0)
+
+
+def _looks_like_quest_reference(key: str) -> bool:
+    normalized = key.strip().casefold()
+    return normalized.startswith(_QUEST_REFERENCE_PREFIXES) or (
+        classify_ftb_text(key) != "other"
+    )
 
 
 def _quest_translation_references(path: Path) -> frozenset[str]:

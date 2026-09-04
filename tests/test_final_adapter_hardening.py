@@ -1342,6 +1342,119 @@ class FinalAdapterHardeningTests(unittest.TestCase):
         self.assertEqual(_snapshot(instance), before)
         self.assertFalse(any(candidate.with_name("ja_jp.json").exists() for candidate in candidates))
 
+    def test_legacy_json_prefers_quest_catalog_over_referenced_mod_catalogs(self) -> None:
+        instance = self.copy_fixture("legacy_raw")
+        references = (
+            instance
+            / "config"
+            / "ftbquests"
+            / "quests"
+            / "chapters"
+            / "catalog_references.snbt"
+        )
+        references.write_text(
+            "{\n"
+            '  title: "{quests.tfg.welcome.title}"\n'
+            '  subtitle: "{material.gtceu.hydrogen}"\n'
+            "  description: [\n"
+            '    "{material.gtceu.oxygen}"\n'
+            '    "{block.expatternprovider.ex_interface}"\n'
+            "  ]\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        catalogs = {
+            "tfg": {"quests.tfg.welcome.title": "Welcome to TFG"},
+            "gtceu": {
+                "material.gtceu.hydrogen": "Hydrogen",
+                "material.gtceu.oxygen": "Oxygen",
+            },
+            "expatternprovider": {
+                "block.expatternprovider.ex_interface": "Extended Interface"
+            },
+        }
+        for namespace, values in catalogs.items():
+            source = (
+                instance
+                / "kubejs"
+                / "assets"
+                / namespace
+                / "lang"
+                / "en_us.json"
+            )
+            source.parent.mkdir(parents=True)
+            source.write_text(json.dumps(values) + "\n", encoding="utf-8")
+
+        before = _snapshot(instance)
+        adapter = create_default_registry().detect(instance, "en_us", "1.20.1")
+        project = adapter.load(instance, "en_us", "ja_jp", "1.20.1")
+        expected = (
+            instance / "kubejs" / "assets" / "tfg" / "lang" / "en_us.json"
+        )
+
+        self.assertEqual(adapter.id, "ftb_legacy_json")
+        self.assertEqual(project.source_path, expected)
+        self.assertEqual(project.default_output, expected.with_name("ja_jp.json"))
+        self.assertEqual(_snapshot(instance), before)
+
+    def test_legacy_json_classified_quest_key_is_a_strong_reference(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source = root / "kubejs" / "assets" / "atm9" / "lang" / "en_us.json"
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            json.dumps({"atm9.quest.welcome.title": "Welcome"}) + "\n",
+            encoding="utf-8",
+        )
+
+        confidence = legacy_json_module._quest_catalog_confidence(
+            source,
+            anchor=root,
+            quest_references=frozenset({"atm9.quest.welcome.title"}),
+        )
+
+        self.assertEqual(confidence, 4)
+
+    def test_legacy_json_duplicate_matching_quest_catalogs_remain_ambiguous(self) -> None:
+        instance = self.copy_fixture("legacy_raw")
+        references = (
+            instance
+            / "config"
+            / "ftbquests"
+            / "quests"
+            / "chapters"
+            / "catalog_references.snbt"
+        )
+        references.write_text(
+            '{ title: "{quests.tfg.welcome.title}" }\n',
+            encoding="utf-8",
+        )
+        candidates = (
+            instance / "kubejs" / "assets" / "tfg" / "lang" / "en_us.json",
+            instance
+            / "resourcepacks"
+            / "duplicate"
+            / "assets"
+            / "tfg"
+            / "lang"
+            / "en_us.json",
+        )
+        for candidate in candidates:
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text(
+                json.dumps({"quests.tfg.welcome.title": "Welcome to TFG"}) + "\n",
+                encoding="utf-8",
+            )
+        adapter = create_default_registry().get("ftb_legacy_json")
+        before = _snapshot(instance)
+
+        with self.assertRaisesRegex(AdapterError, "自動で1つに特定できません"):
+            adapter.load(instance, "en_us", "ja_jp", "1.20.1")
+
+        self.assertEqual(_snapshot(instance), before)
+        self.assertFalse(any(candidate.with_name("ja_jp.json").exists() for candidate in candidates))
+
     def test_legacy_json_referenced_weak_catalog_wins_over_already_keyed_raw_quest(self) -> None:
         instance = self.copy_fixture("legacy_raw")
         candidate = instance / "kubejs" / "assets" / "kubejs" / "lang" / "en_us.json"
