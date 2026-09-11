@@ -34,11 +34,15 @@ from .glossary import GlossaryCatalog, ModLanguageScanner
 from .glossary_snapshot import assert_glossary_inputs_unchanged
 from .instance import InstanceInfo, inspect_instance_root
 from .openai_client import (
+    DEFAULT_API_BASE_URL,
     DEFAULT_TRANSLATION_PROMPT,
     MAX_TRANSLATION_PROMPT_LENGTH,
     ModelInfo,
     OpenAIClient,
     OpenAIRetryEvent,
+    is_official_api_base_url,
+    is_safe_model_id,
+    normalize_api_base_url,
 )
 from .output_guard import (
     PathSnapshot,
@@ -452,7 +456,15 @@ def _is_valid_locale(value: str) -> bool:
     return bool(_LOCALE_PATTERN.fullmatch(value))
 
 
-def _api_key_is_environment_value(api_key: str) -> bool:
+def _api_key_is_environment_value(
+    api_key: str,
+    api_base_url: str = DEFAULT_API_BASE_URL,
+) -> bool:
+    try:
+        if not is_official_api_base_url(normalize_api_base_url(api_base_url)):
+            return False
+    except ValueError:
+        return False
     environment_key = os.getenv("OPENAI_API_KEY", "").strip()
     return bool(environment_key and api_key.strip() == environment_key)
 
@@ -856,15 +868,32 @@ def _validated_glossary_scan_limits(
 
 
 def _model_candidates(settings: AppSettings) -> list[str]:
-    """Return safe persisted candidates, migrating an older selected model."""
+    """Return safe persisted candidates scoped to the selected API endpoint."""
+
+    api_base_url = getattr(settings, "api_base_url", DEFAULT_API_BASE_URL)
+    cached_models_base_url = getattr(
+        settings,
+        "cached_models_base_url",
+        api_base_url,
+    )
+    try:
+        cache_matches_endpoint = normalize_api_base_url(
+            cached_models_base_url
+        ) == normalize_api_base_url(api_base_url)
+    except ValueError:
+        cache_matches_endpoint = False
 
     candidates = [
         model.strip()
-        for model in settings.cached_models
-        if isinstance(model, str) and model.strip() and len(model) <= 512
+        for model in (settings.cached_models if cache_matches_endpoint else ())
+        if is_safe_model_id(model)
     ]
     selected = settings.model.strip()
-    if selected and len(selected) <= 512 and selected not in candidates:
+    if (
+        cache_matches_endpoint
+        and is_safe_model_id(selected)
+        and selected not in candidates
+    ):
         candidates.insert(0, selected)
     return list(dict.fromkeys(candidates))[:MAX_CACHED_MODEL_COUNT]
 
@@ -1524,12 +1553,30 @@ class MainWindow:
         return replace(analysis, log_path=log_path)
 
     def _translate(self) -> None:
-        if not self.session_api_key:
-            messagebox.showwarning("OpenAI設定", "OpenAI APIキーを設定してください。")
+        try:
+            api_base_url = normalize_api_base_url(
+                getattr(self.settings, "api_base_url", DEFAULT_API_BASE_URL)
+            )
+        except ValueError as exc:
+            messagebox.showwarning(
+                "OpenAI設定",
+                f"APIベースURLを確認してください。\n{exc}",
+            )
             self._open_settings("openai")
             return
-        if not self.settings.model.strip():
-            messagebox.showwarning("OpenAI設定", "使用するモデルを選択してください。")
+        official_endpoint = is_official_api_base_url(api_base_url)
+        if official_endpoint and not self.session_api_key:
+            messagebox.showwarning(
+                "OpenAI設定",
+                "OpenAI公式APIを使用するにはAPIキーを設定してください。",
+            )
+            self._open_settings("openai")
+            return
+        if not is_safe_model_id(self.settings.model.strip()):
+            messagebox.showwarning(
+                "OpenAI設定",
+                "使用するモデルIDを設定してください。",
+            )
             self._open_settings("openai")
             return
         analysis = getattr(self, "_analysis", None)
@@ -1559,7 +1606,7 @@ class MainWindow:
         batch_size = self.settings.batch_size
         batch_char_limit = self.settings.batch_char_limit
         translation_prompt = self.settings.translation_prompt
-        fast_mode = self.settings.fast_mode
+        fast_mode = bool(self.settings.fast_mode and official_endpoint)
         debug_logging = self.settings.debug_logging
 
         selected_labels = [
@@ -1569,6 +1616,7 @@ class MainWindow:
         ]
         self._append_log(
             "\n=== 翻訳開始 ===\n"
+            f"API送信先: {api_base_url}\n"
             f"モデル: {model}\n"
             f"Fast Mode: {'ON' if fast_mode else 'OFF'}\n"
             f"timeout: {request_timeout}秒\n"
@@ -1727,6 +1775,7 @@ class MainWindow:
                 skip=skip_glossary_confirmation,
             )
             client = OpenAIClient(
+                base_url=api_base_url,
                 timeout=request_timeout,
                 max_retries=max_retries,
                 translation_prompt=translation_prompt,
@@ -2331,9 +2380,22 @@ class MainWindow:
 
     def _open_settings(self, initial_tab: str | None = None) -> SettingsDialog:
         if initial_tab is None:
+            try:
+                api_base_url = normalize_api_base_url(
+                    getattr(self.settings, "api_base_url", DEFAULT_API_BASE_URL)
+                )
+                endpoint_ready = bool(
+                    self.settings.model.strip()
+                    and (
+                        self.session_api_key
+                        or not is_official_api_base_url(api_base_url)
+                    )
+                )
+            except ValueError:
+                endpoint_ready = False
             initial_tab = (
                 "openai"
-                if not self.session_api_key or not self.settings.model.strip()
+                if not endpoint_ready
                 else "translation"
             )
 
@@ -2406,6 +2468,7 @@ class MainWindow:
         self._append_log(
             f"設定を更新しました（locale: {settings.source_locale} → {settings.target_locale}、"
             f"既存翻訳の再利用: {reuse}、resourcepacks走査: {resourcepacks}、"
+            f"API送信先: {getattr(settings, 'api_base_url', DEFAULT_API_BASE_URL)}、"
             f"固有名詞保護の確認: {confirmation}、モデル: {settings.model or '未選択'}、"
             f"Fast Mode: {mode}、timeout: {settings.request_timeout}秒、"
             f"通信再試行: {settings.max_retries}回、固有名詞保護の走査上限: "
@@ -2865,8 +2928,18 @@ class SettingsDialog:
             value=self.settings.glossary_max_total_language_mib
         )
         self.glossary_limit_status_var = tk.StringVar(value="")
+        initial_api_base_url = getattr(
+            self.settings,
+            "api_base_url",
+            DEFAULT_API_BASE_URL,
+        )
+        self.api_base_url_var = tk.StringVar(value=initial_api_base_url)
+        self._api_base_url_identity = self._endpoint_identity(initial_api_base_url)
         self._initial_api_key = api_key.strip()
-        self.api_key_from_environment = _api_key_is_environment_value(api_key)
+        self.api_key_from_environment = _api_key_is_environment_value(
+            api_key,
+            initial_api_base_url,
+        )
         self.api_key_var = tk.StringVar(value=api_key)
         self.save_key_var = tk.BooleanVar(
             value=_save_api_key_initially_selected(
@@ -2887,13 +2960,26 @@ class SettingsDialog:
             value=(
                 "保存済みモデル一覧を読み込みました。必要な場合だけ再取得してください。"
                 if self.models
-                else "APIキーを入力し、モデル一覧を取得してください。"
+                else (
+                    "APIベースURLを入力してください。"
+                    if self._api_base_url_identity[0] == "invalid"
+                    else (
+                        "モデル一覧を取得するか、互換APIのモデルIDを直接入力してください。"
+                        if self._is_custom_endpoint(initial_api_base_url)
+                        else "APIキーを入力し、モデル一覧を取得してください。"
+                    )
+                )
             )
         )
         self.fetching = False
         self.model_cancel_event = threading.Event()
         self.model_events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._build()
+        self._api_base_url_trace_id = self.api_base_url_var.trace_add(
+            "write",
+            self._api_base_url_changed,
+        )
+        self._update_api_endpoint_controls()
         self._select_tab(initial_tab)
         self.window.bind("<Escape>", lambda _event: self._close())
         self.window.protocol("WM_DELETE_WINDOW", self._close)
@@ -2978,6 +3064,100 @@ class SettingsDialog:
         }.get(tab_name)
         if notebook is not None and tab is not None:
             notebook.select(tab)
+
+    @staticmethod
+    def _endpoint_identity(value: str) -> tuple[str, str]:
+        try:
+            return ("valid", normalize_api_base_url(value))
+        except ValueError:
+            return ("invalid", value.strip())
+
+    @staticmethod
+    def _is_custom_endpoint(value: str) -> bool:
+        try:
+            return not is_official_api_base_url(normalize_api_base_url(value))
+        except ValueError:
+            return False
+
+    def _api_base_url_changed(self, *_args: object) -> None:
+        value = self.api_base_url_var.get()
+        identity = self._endpoint_identity(value)
+        if identity == getattr(self, "_api_base_url_identity", None):
+            self._update_api_endpoint_controls()
+            return
+        self._api_base_url_identity = identity
+        self.model_cancel_event.set()
+        self.api_key_var.set("")
+        self.save_key_var.set(False)
+        self.api_key_from_environment = False
+        self._initial_api_key = ""
+        self.models = []
+        self.model_var.set("")
+        self.fast_mode_var.set(False)
+        model_combo = getattr(self, "model_combo", None)
+        if model_combo is not None:
+            model_combo.configure(values=())
+        self._update_api_endpoint_controls()
+        if identity[0] == "invalid":
+            self.status_var.set("APIベースURLを確認してください。")
+        elif self._is_custom_endpoint(identity[1]):
+            self.status_var.set(
+                "送信先を変更しました。モデル一覧を取得するか、モデルIDを直接入力してください。"
+            )
+        else:
+            self.status_var.set(
+                "OpenAI公式APIへ変更しました。APIキーとモデルを設定してください。"
+            )
+
+    def _reset_api_base_url(self) -> None:
+        if self.api_base_url_var.get().strip() == DEFAULT_API_BASE_URL:
+            self.status_var.set("OpenAI公式APIのベースURLが設定されています。")
+            return
+        self.api_base_url_var.set(DEFAULT_API_BASE_URL)
+
+    def _update_api_endpoint_controls(self) -> None:
+        try:
+            api_base_url = normalize_api_base_url(self.api_base_url_var.get())
+        except ValueError:
+            api_base_url = ""
+        official = bool(
+            api_base_url and is_official_api_base_url(api_base_url)
+        )
+        if not official:
+            self.fast_mode_var.set(False)
+        fetching = bool(getattr(self, "fetching", False))
+        model_state = (
+            "disabled"
+            if fetching or not api_base_url
+            else ("readonly" if official else "normal")
+        )
+        model_combo = getattr(self, "model_combo", None)
+        if model_combo is not None:
+            model_combo.configure(state=model_state)
+        fast_mode_check = getattr(self, "fast_mode_check", None)
+        if fast_mode_check is not None:
+            fast_mode_check.configure(
+                state="normal" if official and not fetching else "disabled"
+            )
+        fast_mode_help = getattr(self, "fast_mode_help", None)
+        if fast_mode_help is not None:
+            fast_mode_help.configure(
+                text=(
+                    "翻訳POSTだけにpriority tierを指定します。"
+                    "利用可否・追加料金はOpenAIの契約に依存します。"
+                    if official
+                    else "Fast ModeはOpenAI公式APIでのみ使用できます。"
+                )
+            )
+        save_key_check = getattr(self, "save_key_check", None)
+        if save_key_check is not None:
+            save_key_check.configure(
+                text=(
+                    "環境変数のAPIキーをWindows DPAPIへ暗号化保存（明示時のみ）"
+                    if self.api_key_from_environment and official
+                    else "Windows DPAPIでこのユーザー用に暗号化保存"
+                )
+            )
 
     def _build_translation_tab(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(1, weight=1)
@@ -3240,10 +3420,57 @@ class SettingsDialog:
 
     def _build_openai_tab(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(5, weight=1)
-        ttk.Label(frame, text="OpenAI APIキー").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
+        frame.rowconfigure(8, weight=1)
+        ttk.Label(frame, text="APIベースURL").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(0, 10),
+            pady=6,
+        )
+        endpoint_row = ttk.Frame(frame)
+        endpoint_row.grid(row=0, column=1, sticky="ew", pady=6)
+        endpoint_row.columnconfigure(0, weight=1)
+        self.api_base_url_entry = ttk.Entry(
+            endpoint_row,
+            textvariable=self.api_base_url_var,
+        )
+        self.api_base_url_entry.grid(row=0, column=0, sticky="ew")
+        self.reset_api_base_url_button = ttk.Button(
+            endpoint_row,
+            text="OpenAI公式へ戻す",
+            command=self._reset_api_base_url,
+        )
+        self.reset_api_base_url_button.grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(
+            frame,
+            text=(
+                "Responses APIのルートURL（例: https://api.openai.com/v1）を指定します。"
+                " /responses は付けません。\n"
+                "入力したAPIキー、翻訳対象、プロンプトはこの送信先へ送られます。"
+                "信頼できるURLだけを指定してください。"
+            ),
+            foreground="#9a3412",
+            justify="left",
+            wraplength=600,
+        ).grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            padx=(0, 0),
+            pady=(0, 10),
+        )
+
+        ttk.Label(frame, text="APIキー（互換APIでは任意）").grid(
+            row=2,
+            column=0,
+            sticky="w",
+            padx=(0, 10),
+            pady=6,
+        )
         self.api_key_entry = ttk.Entry(frame, textvariable=self.api_key_var, show="●")
-        self.api_key_entry.grid(row=0, column=1, sticky="ew", pady=6)
+        self.api_key_entry.grid(row=2, column=1, sticky="ew", pady=6)
         self.save_key_check = ttk.Checkbutton(
             frame,
             text=(
@@ -3254,21 +3481,21 @@ class SettingsDialog:
             variable=self.save_key_var,
             state="normal" if self.store.secure_persistence_available else "disabled",
         )
-        self.save_key_check.grid(row=1, column=1, sticky="w")
+        self.save_key_check.grid(row=3, column=1, sticky="w")
 
-        ttk.Label(frame, text="モデル").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=(16, 6))
+        ttk.Label(frame, text="モデルID").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=(16, 6))
         self.model_combo = ttk.Combobox(
             frame,
             textvariable=self.model_var,
             values=self.models,
             state="readonly",
         )
-        self.model_combo.grid(row=2, column=1, sticky="ew", pady=(16, 6))
+        self.model_combo.grid(row=4, column=1, sticky="ew", pady=(16, 6))
         self.fetch_button = ttk.Button(frame, text="利用可能なモデルを取得", command=self._fetch_models)
-        self.fetch_button.grid(row=3, column=1, sticky="w")
+        self.fetch_button.grid(row=5, column=1, sticky="w")
 
         advanced = ttk.LabelFrame(frame, text="翻訳リクエスト", padding=10)
-        advanced.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 6))
+        advanced.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(16, 6))
         for column in range(6):
             advanced.columnconfigure(column, weight=1 if column % 2 else 0)
         ttk.Label(advanced, text="1バッチ件数").grid(row=0, column=0, padx=(0, 6))
@@ -3345,7 +3572,7 @@ class SettingsDialog:
         )
 
         prompt_box = ttk.LabelFrame(frame, text="カスタム翻訳プロンプト", padding=10)
-        prompt_box.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(10, 6))
+        prompt_box.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=(10, 6))
         prompt_box.columnconfigure(0, weight=1)
         prompt_box.rowconfigure(1, weight=1)
         prompt_header = ttk.Frame(prompt_box)
@@ -3384,7 +3611,7 @@ class SettingsDialog:
         self.prompt_text.insert("1.0", initial_prompt)
 
         ttk.Label(frame, textvariable=self.status_var, foreground="#4b5563", wraplength=560).grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(8, 14)
+            row=9, column=0, columnspan=2, sticky="w", pady=(8, 14)
         )
 
     def _build_logging_tab(self, frame: ttk.Frame) -> None:
@@ -3422,9 +3649,22 @@ class SettingsDialog:
         )
 
     def _fetch_models(self) -> None:
+        try:
+            api_base_url = normalize_api_base_url(self.api_base_url_var.get())
+        except ValueError as exc:
+            messagebox.showwarning(
+                "APIベースURL",
+                str(exc),
+                parent=self.window,
+            )
+            return
         api_key = self.api_key_var.get().strip()
-        if not api_key:
-            messagebox.showwarning("APIキー", "OpenAI APIキーを入力してください。", parent=self.window)
+        if is_official_api_base_url(api_base_url) and not api_key:
+            messagebox.showwarning(
+                "APIキー",
+                "OpenAI公式APIを使用するにはAPIキーを入力してください。",
+                parent=self.window,
+            )
             return
         try:
             timeout = int(self.timeout_var.get())
@@ -3442,7 +3682,7 @@ class SettingsDialog:
             messagebox.showwarning("リクエスト設定", message, parent=self.window)
             return
         self._set_fetching(True)
-        self.status_var.set("OpenAIからモデル一覧を取得しています…")
+        self.status_var.set("APIからモデル一覧を取得しています…")
         self.model_cancel_event.set()
         self.model_cancel_event = threading.Event()
         cancel_event = self.model_cancel_event
@@ -3450,6 +3690,7 @@ class SettingsDialog:
         def work() -> None:
             try:
                 client = OpenAIClient(
+                    base_url=api_base_url,
                     timeout=timeout,
                     max_retries=max_retries,
                     on_retry=lambda event: self._queue_model_retry(event, api_key),
@@ -3460,7 +3701,9 @@ class SettingsDialog:
                     ),
                 )
                 models = client.list_models(api_key, cancel_event)
-                self.model_events.put(("loaded", (api_key, models)))
+                self.model_events.put(
+                    ("loaded", (api_key, api_base_url, models))
+                )
             except CancelledError:
                 return
             except LocalizerError as exc:
@@ -3537,8 +3780,8 @@ class SettingsDialog:
             while True:
                 event, payload = self.model_events.get_nowait()
                 if event == "loaded":
-                    api_key, models = payload
-                    self._models_loaded(api_key, models)
+                    api_key, api_base_url, models = payload
+                    self._models_loaded(api_key, models, api_base_url)
                 elif event == "retry":
                     self._model_retrying(payload)
                 else:
@@ -3547,34 +3790,61 @@ class SettingsDialog:
             pass
         self._drain_after_id = self.window.after(100, self._drain_model_events)
 
-    def _models_loaded(self, api_key: str, models: list[ModelInfo]) -> None:
+    def _models_loaded(
+        self,
+        api_key: str,
+        models: list[ModelInfo],
+        api_base_url: str | None = None,
+    ) -> None:
         if not self.window.winfo_exists():
             return
-        if self.api_key_var.get().strip() != api_key:
-            self.status_var.set("APIキーが変更されたため、取得結果を破棄しました。")
+        try:
+            current_api_base_url = normalize_api_base_url(
+                self.api_base_url_var.get()
+                if hasattr(self, "api_base_url_var")
+                else DEFAULT_API_BASE_URL
+            )
+        except ValueError:
+            current_api_base_url = ""
+        requested_api_base_url = api_base_url or current_api_base_url
+        if (
+            self.api_key_var.get().strip() != api_key
+            or current_api_base_url != requested_api_base_url
+        ):
+            self.status_var.set(
+                "APIキーまたは送信先が変更されたため、取得結果を破棄しました。"
+            )
             self._set_fetching(False)
             return
         loaded_models = list(
             dict.fromkeys(
                 model.id.strip()
                 for model in models
-                if model.id.strip() and len(model.id) <= 512
+                if is_safe_model_id(model.id.strip())
             )
         )[:MAX_CACHED_MODEL_COUNT]
         if not loaded_models:
             if self.models:
                 self.status_var.set(
-                    "テキスト生成モデルを取得できなかったため、保存済み候補を維持します。"
+                    "モデルを取得できなかったため、保存済み候補を維持します。"
+                )
+            elif not is_official_api_base_url(current_api_base_url):
+                self.status_var.set(
+                    "モデル一覧が空です。互換APIのモデルIDを直接入力できます。"
                 )
             else:
-                self.status_var.set("利用できるテキスト生成モデルが見つかりませんでした。")
+                self.status_var.set("利用できるモデルが見つかりませんでした。")
             self._set_fetching(False)
             return
         self.models = loaded_models
         self.model_combo.configure(values=self.models)
-        if self.model_var.get() not in self.models:
+        current_model = self.model_var.get().strip()
+        if not current_model or (
+            is_official_api_base_url(current_api_base_url)
+            and current_model not in self.models
+        ):
             self.model_var.set(self.models[0] if self.models else "")
-        self.status_var.set(f"{len(self.models)} 件のテキスト生成モデルを取得しました。")
+        self.status_var.set(f"{len(self.models)} 件のモデルを取得しました。")
         self._set_fetching(False)
 
     def _model_retrying(self, notice: _DurableLogEvent) -> None:
@@ -3638,16 +3908,17 @@ class SettingsDialog:
     def _set_fetching(self, fetching: bool) -> None:
         self.fetching = fetching
         state = "disabled" if fetching else "normal"
+        self.api_base_url_entry.configure(state=state)
+        self.reset_api_base_url_button.configure(state=state)
         self.api_key_entry.configure(state=state)
         self.save_key_check.configure(
             state="disabled" if fetching or not self.store.secure_persistence_available else "normal"
         )
-        self.model_combo.configure(state="disabled" if fetching else "readonly")
+        self._update_api_endpoint_controls()
         self.batch_spin.configure(state=state)
         self.char_limit_spin.configure(state=state)
         self.timeout_spin.configure(state=state)
         self.retry_spin.configure(state=state)
-        self.fast_mode_check.configure(state=state)
         self.prompt_text.configure(state=state)
         self.reset_prompt_button.configure(state=state)
         self.fetch_button.configure(state=state)
@@ -3709,6 +3980,28 @@ class SettingsDialog:
 
         api_key = self.api_key_var.get().strip()
         model = self.model_var.get().strip()
+        try:
+            api_base_url = normalize_api_base_url(
+                str(
+                    value(
+                        "api_base_url_var",
+                        getattr(
+                            self.settings,
+                            "api_base_url",
+                            DEFAULT_API_BASE_URL,
+                        ),
+                    )
+                )
+            )
+        except ValueError as exc:
+            self._select_tab("openai")
+            messagebox.showwarning(
+                "APIベースURL",
+                str(exc),
+                parent=self.window,
+            )
+            return
+        official_endpoint = is_official_api_base_url(api_base_url)
         source_locale = str(
             value("source_locale_var", self.settings.source_locale)
         ).strip().lower()
@@ -3767,7 +4060,15 @@ class SettingsDialog:
                 parent=self.window,
             )
             return
-        if model and model not in self.models:
+        if model and not is_safe_model_id(model):
+            self._select_tab("openai")
+            messagebox.showwarning(
+                "モデル",
+                "有効なモデルIDを入力してください。",
+                parent=self.window,
+            )
+            return
+        if official_endpoint and model and model not in self.models:
             self._select_tab("openai")
             messagebox.showwarning(
                 "モデル",
@@ -3822,9 +4123,16 @@ class SettingsDialog:
             self.settings.glossary_max_total_language_mib = (
                 glossary_scan_limits.max_total_language_mib
             )
+            self.settings.api_base_url = api_base_url
             self.settings.model = model
-            self.settings.cached_models = list(self.models)
-            self.settings.fast_mode = bool(self.fast_mode_var.get())
+            cached_models = list(self.models)
+            if model and model not in cached_models:
+                cached_models.insert(0, model)
+            self.settings.cached_models = cached_models[:MAX_CACHED_MODEL_COUNT]
+            self.settings.cached_models_base_url = api_base_url
+            self.settings.fast_mode = bool(
+                official_endpoint and self.fast_mode_var.get()
+            )
             self.settings.debug_logging = bool(
                 value("debug_logging_var", self.settings.debug_logging)
             )

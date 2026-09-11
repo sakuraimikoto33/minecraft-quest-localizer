@@ -7,6 +7,7 @@ import socket
 import ssl
 import sys
 import threading
+import traceback
 import unittest
 import urllib.error
 from dataclasses import FrozenInstanceError
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from mq_localizer.domain import CancelledError, TranslationError  # noqa: E402
 import mq_localizer.openai_client as openai_client_module  # noqa: E402
 from mq_localizer.openai_client import (  # noqa: E402
+    DEFAULT_API_BASE_URL,
     DEFAULT_TRANSLATION_PROMPT,
     FAST_MODE_SERVICE_TIER,
     IMMUTABLE_TRANSLATION_PROTOCOL,
@@ -29,6 +31,9 @@ from mq_localizer.openai_client import (  # noqa: E402
     OpenAIResponseProtocolError,
     OpenAIRetryEvent,
     UrllibJsonTransport,
+    is_official_api_base_url,
+    is_safe_model_id,
+    normalize_api_base_url,
 )
 from mq_localizer.protection import TokenProtector  # noqa: E402
 from mq_localizer.unicode_safety import JAPANESE_UNICODE_INSTRUCTIONS  # noqa: E402
@@ -91,6 +96,282 @@ def _parsed_debug_event(message: str) -> tuple[str, dict[str, Any]]:
     if not isinstance(parsed, dict):
         raise AssertionError("debug event payload is not an object")
     return heading, parsed
+
+
+class CompatibleAPIEndpointTests(unittest.TestCase):
+    def test_base_url_normalization_accepts_https_and_local_http(self) -> None:
+        cases = {
+            "  HTTPS://API.EXAMPLE.COM/v1///  ": "https://api.example.com/v1",
+            "https://api.example.com:8443/root/": "https://api.example.com:8443/root",
+            "https://api.example.com:443/v1": "https://api.example.com/v1",
+            "http://localhost:11434/v1/": "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1": "http://127.0.0.1:8080/v1",
+            "http://[::1]:8080/v1/": "http://[::1]:8080/v1",
+            "http://[::ffff:127.0.0.1]/v1": "http://[::ffff:127.0.0.1]/v1",
+        }
+
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_api_base_url(raw), expected)
+
+    def test_base_url_normalization_rejects_unsafe_or_ambiguous_values(self) -> None:
+        invalid_values = (
+            "",
+            "   ",
+            "/v1",
+            "api.example.com/v1",
+            "ftp://api.example.com/v1",
+            "http://api.example.com/v1",
+            "https://user:secret@api.example.com/v1",
+            "https://api.example.com/v1?token=secret",
+            "https://api.example.com/v1#fragment",
+            "https://api.example.com/v1\\responses",
+            "https://api.example.com/a b",
+            "https://api.example.com/\nv1",
+            "https://api.example.com:0/v1",
+            "https://api.example.com:65536/v1",
+            "https://api.example.com:not-a-port/v1",
+            "https://api.example.com:/v1",
+            "https:///v1",
+            "https://[v1.fe80]/v1",
+            "https://例.example/v1",
+            "https://api.example.com/v1/翻訳",
+            "https://api.example.com/" + "x" * 2048,
+            " https://api.example.com/v1" + " " * 2048,
+        )
+
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    normalize_api_base_url(value)
+
+    def test_only_exact_openai_v1_root_is_recognized_as_official(self) -> None:
+        self.assertEqual(DEFAULT_API_BASE_URL, "https://api.openai.com/v1")
+        for value in (
+            DEFAULT_API_BASE_URL,
+            "HTTPS://API.OPENAI.COM/v1/",
+            "https://api.openai.com:443/v1",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(is_official_api_base_url(value))
+        for value in (
+            "https://api.openai.com/v1/proxy",
+            "https://api.openai.com:444/v1",
+            "https://openai.example/v1",
+            "http://localhost:11434/v1",
+            "invalid",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(is_official_api_base_url(value))
+
+    def test_model_id_safety_rejects_controls_edges_and_excessive_length(self) -> None:
+        self.assertTrue(is_safe_model_id("provider/model:latest"))
+        for value in (
+            "",
+            " model",
+            "model ",
+            "bad\nmodel",
+            "bad\x85model",
+            "bad\u200bmodel",
+            "bad\u2028model",
+            "x" * 513,
+            "\ud800",
+            None,
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(is_safe_model_id(value))
+
+    def test_redirect_handler_retains_same_origin_get_credentials(self) -> None:
+        request = openai_client_module.urllib.request.Request(
+            "https://api.example/v1/models",
+            headers={"Authorization": "Bearer secret", "X-Test": "value"},
+            method="GET",
+        )
+
+        redirected = openai_client_module._SameOriginAPIRedirectHandler().redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://api.example:443/v2/models",
+        )
+
+        self.assertIsNotNone(redirected)
+        assert redirected is not None
+        self.assertEqual(redirected.get_method(), "GET")
+        self.assertEqual(redirected.get_header("Authorization"), "Bearer secret")
+        self.assertEqual(redirected.get_header("X-test"), "value")
+
+    def test_redirect_handler_preserves_same_origin_post_only_for_307_308(self) -> None:
+        request = openai_client_module.urllib.request.Request(
+            "https://api.example/v1/responses",
+            data=b'{"model":"test"}',
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        handler = openai_client_module._SameOriginAPIRedirectHandler()
+
+        for status in (307, 308):
+            with self.subTest(status=status):
+                redirected = handler.redirect_request(
+                    request,
+                    None,
+                    status,
+                    "Redirect",
+                    {},
+                    "https://api.example/v2/responses",
+                )
+                self.assertIsNotNone(redirected)
+                assert redirected is not None
+                self.assertEqual(redirected.get_method(), "POST")
+                self.assertEqual(redirected.data, request.data)
+                self.assertEqual(
+                    redirected.get_header("Authorization"),
+                    "Bearer secret",
+                )
+
+        for status in (301, 302, 303):
+            with self.subTest(status=status), self.assertRaises(OpenAIAPIError) as caught:
+                handler.redirect_request(
+                    request,
+                    None,
+                    status,
+                    "Redirect",
+                    {},
+                    "https://api.example/v2/responses",
+                )
+            self.assertFalse(caught.exception.retryable)
+            self.assertEqual(caught.exception.kind, "redirect")
+
+    def test_redirect_handler_rejects_cross_origin_and_https_downgrade(self) -> None:
+        request = openai_client_module.urllib.request.Request(
+            "https://api.example/v1/models",
+            headers={"Authorization": "Bearer must-not-leak"},
+            method="GET",
+        )
+        handler = openai_client_module._SameOriginAPIRedirectHandler()
+
+        for target in (
+            "https://other.example/v1/models",
+            "https://api.example:444/v1/models",
+            "http://api.example/v1/models",
+            "https://user@api.example/v1/models",
+        ):
+            with self.subTest(target=target), self.assertRaises(OpenAIAPIError) as caught:
+                handler.redirect_request(request, None, 302, "Found", {}, target)
+            self.assertFalse(caught.exception.retryable)
+            self.assertEqual(caught.exception.kind, "redirect")
+
+    def test_loopback_requests_install_an_explicit_empty_proxy_handler(self) -> None:
+        class RecordingOpener:
+            def __init__(self) -> None:
+                self.calls: list[tuple[object, int]] = []
+
+            def open(self, request: object, timeout: int) -> object:
+                self.calls.append((request, timeout))
+                return object()
+
+        for url in (
+            "http://localhost:11434/v1/models",
+            "http://127.0.0.1:8080/v1/models",
+            "http://[::1]:8080/v1/models",
+            "https://localhost/v1/models",
+        ):
+            with self.subTest(url=url):
+                opener = RecordingOpener()
+                request = openai_client_module.urllib.request.Request(url)
+                with patch.object(
+                    openai_client_module.urllib.request,
+                    "build_opener",
+                    return_value=opener,
+                ) as build_opener:
+                    response = openai_client_module._open_api_request(request, 17)
+
+                self.assertIsNotNone(response)
+                self.assertEqual(opener.calls, [(request, 17)])
+                supplied_handlers = build_opener.call_args.args
+                proxy_handlers = [
+                    handler
+                    for handler in supplied_handlers
+                    if isinstance(handler, openai_client_module.urllib.request.ProxyHandler)
+                ]
+                self.assertEqual(len(proxy_handlers), 1)
+                self.assertEqual(proxy_handlers[0].proxies, {})
+
+    def test_remote_https_request_keeps_default_proxy_discovery(self) -> None:
+        class RecordingOpener:
+            def open(self, _request: object, timeout: int) -> tuple[str, int]:
+                return "response", timeout
+
+        request = openai_client_module.urllib.request.Request(
+            "https://compatible.example/v1/models"
+        )
+        with patch.object(
+            openai_client_module.urllib.request,
+            "build_opener",
+            return_value=RecordingOpener(),
+        ) as build_opener:
+            response = openai_client_module._open_api_request(request, 23)
+
+        self.assertEqual(response, ("response", 23))
+        self.assertFalse(
+            any(
+                isinstance(handler, openai_client_module.urllib.request.ProxyHandler)
+                for handler in build_opener.call_args.args
+            )
+        )
+
+    def test_redirect_response_body_is_read_with_a_hard_size_limit(self) -> None:
+        class UnboundedRedirectBody:
+            def __init__(self) -> None:
+                self.read_sizes: list[int] = []
+                self.closed = False
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                return b"x" * size
+
+            def close(self) -> None:
+                self.closed = True
+
+        class Parent:
+            called = False
+
+            def open(self, _request: object, timeout: int) -> object:
+                self.called = True
+                return timeout
+
+        handler = openai_client_module._SameOriginAPIRedirectHandler()
+        parent = Parent()
+        handler.add_parent(parent)
+        request = openai_client_module.urllib.request.Request(
+            "https://api.example/v1/models",
+            method="GET",
+        )
+        request.timeout = 10
+        body = UnboundedRedirectBody()
+
+        with (
+            patch.object(openai_client_module, "_MAX_API_RESPONSE_BYTES", 32),
+            self.assertRaisesRegex(OpenAIAPIError, "安全上限") as caught,
+        ):
+            handler.http_error_302(
+                request,
+                body,
+                302,
+                "Found",
+                {"location": "https://api.example/v2/models"},
+            )
+
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.kind, "invalid_response")
+        self.assertEqual(body.read_sizes, [33])
+        self.assertTrue(body.closed)
+        self.assertFalse(parent.called)
 
 
 class OpenAIModelTests(unittest.TestCase):
@@ -195,6 +476,50 @@ class OpenAIModelTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, combined)
 
+    def test_debug_hook_masks_camelcase_and_alternate_secret_field_names(self) -> None:
+        secrets = {
+            "apiKey": "camel-api-secret",
+            "accessToken": "camel-access-secret",
+            "client.secret": "dotted-client-secret",
+            "refresh token": "spaced-refresh-secret",
+            "proxyAuthorization": "camel-proxy-secret",
+            "x-auth-token": "alternate-auth-secret",
+        }
+        response = {
+            "data": [],
+            **secrets,
+            "embedded": json.dumps(
+                {
+                    "apiKey": "embedded-api-secret",
+                    "xAuthToken": "embedded-auth-secret",
+                }
+            ),
+            "free_text": (
+                "clientSecret=free-client-secret\n"
+                "proxy.authorization: free-proxy-secret\n"
+                "x_auth_token = free-auth-secret"
+            ),
+        }
+        events: list[str] = []
+
+        OpenAIClient(
+            transport=SequenceTransport(response),
+            on_debug=events.append,
+        ).list_models("ordinary-key")
+
+        combined = "\n".join(events)
+        for secret in (
+            *secrets.values(),
+            "embedded-api-secret",
+            "embedded-auth-secret",
+            "free-client-secret",
+            "free-proxy-secret",
+            "free-auth-secret",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, combined)
+        self.assertGreaterEqual(combined.count("[REDACTED]"), 11)
+
     def test_debug_hook_records_every_retry_in_request_error_request_response_order(
         self,
     ) -> None:
@@ -287,8 +612,8 @@ class OpenAIModelTests(unittest.TestCase):
         with (
             patch.object(openai_client_module, "_MAX_API_RESPONSE_BYTES", 32),
             patch.object(
-                openai_client_module.urllib.request,
-                "urlopen",
+                openai_client_module,
+                "_open_api_request",
                 return_value=OversizedResponse(),
             ),
         ):
@@ -321,8 +646,8 @@ class OpenAIModelTests(unittest.TestCase):
         for failure, expected_kind in failures:
             with self.subTest(failure=type(failure).__name__, kind=expected_kind):
                 with patch.object(
-                    openai_client_module.urllib.request,
-                    "urlopen",
+                    openai_client_module,
+                    "_open_api_request",
                     side_effect=failure,
                 ):
                     with self.assertRaises(OpenAIAPIError) as caught:
@@ -349,8 +674,8 @@ class OpenAIModelTests(unittest.TestCase):
         for failure in failures:
             with self.subTest(failure=type(failure).__name__):
                 with patch.object(
-                    openai_client_module.urllib.request,
-                    "urlopen",
+                    openai_client_module,
+                    "_open_api_request",
                     side_effect=failure,
                 ):
                     with self.assertRaises(OpenAIAPIError) as caught:
@@ -377,8 +702,8 @@ class OpenAIModelTests(unittest.TestCase):
                 raise http.client.IncompleteRead(b"partial", 100)
 
         with patch.object(
-            openai_client_module.urllib.request,
-            "urlopen",
+            openai_client_module,
+            "_open_api_request",
             return_value=IncompleteResponse(),
         ):
             with self.assertRaises(OpenAIAPIError) as caught:
@@ -431,8 +756,8 @@ class OpenAIModelTests(unittest.TestCase):
                     FailingBody(body_error),
                 )
                 with patch.object(
-                    openai_client_module.urllib.request,
-                    "urlopen",
+                    openai_client_module,
+                    "_open_api_request",
                     side_effect=http_error,
                 ):
                     with self.assertRaises(OpenAIAPIError) as caught:
@@ -461,8 +786,8 @@ class OpenAIModelTests(unittest.TestCase):
         for response_bytes, expected_debug_body in malformed_responses:
             with self.subTest(response=response_bytes):
                 with patch.object(
-                    openai_client_module.urllib.request,
-                    "urlopen",
+                    openai_client_module,
+                    "_open_api_request",
                     return_value=io.BytesIO(response_bytes),
                 ):
                     with self.assertRaises(OpenAIAPIError) as caught:
@@ -488,8 +813,8 @@ class OpenAIModelTests(unittest.TestCase):
         events: list[str] = []
 
         with patch.object(
-            openai_client_module.urllib.request,
-            "urlopen",
+            openai_client_module,
+            "_open_api_request",
             return_value=io.BytesIO(response_bytes),
         ):
             with self.assertRaises(OpenAIAPIError):
@@ -525,7 +850,7 @@ class OpenAIModelTests(unittest.TestCase):
                 ]
             }
         )
-        client = OpenAIClient(transport=transport, base_url="https://unit.invalid/v1/", timeout=7)
+        client = OpenAIClient(transport=transport, timeout=7)
 
         models = client.list_models("  secret-key  ")
 
@@ -537,10 +862,91 @@ class OpenAIModelTests(unittest.TestCase):
         self.assertEqual(len(transport.calls), 1)
         call = transport.calls[0]
         self.assertEqual(call["method"], "GET")
-        self.assertEqual(call["url"], "https://unit.invalid/v1/models")
+        self.assertEqual(call["url"], "https://api.openai.com/v1/models")
         self.assertEqual(call["headers"]["Authorization"], "Bearer secret-key")
         self.assertIsNone(call["payload"])
         self.assertEqual(call["timeout"], 7)
+
+    def test_compatible_models_accept_provider_ids_and_keyless_access(self) -> None:
+        transport = SequenceTransport(
+            {
+                "data": [
+                    {"id": "vendor/translator:latest", "created": "unknown"},
+                    {"id": "llama-3.3", "created": 20, "owned_by": 123},
+                    {"id": "embedding-but-provider-says-it-translates", "created": 10},
+                    {"id": "bad\nmodel", "created": 999},
+                    {"created": 1000},
+                ]
+            }
+        )
+        client = OpenAIClient(
+            transport=transport,
+            base_url="https://compatible.example/v1/",
+        )
+
+        models = client.list_models("")
+
+        self.assertEqual(
+            [model.id for model in models],
+            [
+                "llama-3.3",
+                "embedding-but-provider-says-it-translates",
+                "vendor/translator:latest",
+            ],
+        )
+        self.assertEqual(models[-1].created, 0)
+        self.assertEqual(models[0].owned_by, "")
+        self.assertNotIn("Authorization", transport.calls[0]["headers"])
+        self.assertEqual(
+            transport.calls[0]["url"],
+            "https://compatible.example/v1/models",
+        )
+
+    def test_official_endpoint_requires_key_but_compatible_endpoint_does_not(self) -> None:
+        official_transport = SequenceTransport({"data": []})
+        with self.assertRaisesRegex(OpenAIAPIError, "API キー"):
+            OpenAIClient(transport=official_transport).list_models("")
+        self.assertEqual(official_transport.calls, [])
+
+        compatible_transport = SequenceTransport({"data": []})
+        self.assertEqual(
+            OpenAIClient(
+                transport=compatible_transport,
+                base_url="http://localhost:11434/v1",
+            ).list_models(""),
+            [],
+        )
+        self.assertEqual(len(compatible_transport.calls), 1)
+
+    def test_api_key_control_characters_are_rejected_before_transport(self) -> None:
+        for api_key in (
+            "secret\r\nInjected: value",
+            "secret\x85value",
+            "secret\u2028value",
+            "秘密の鍵",
+            "secret\ud800value",
+        ):
+            transport = SequenceTransport({"data": []})
+            with self.subTest(api_key=api_key), self.assertRaisesRegex(
+                OpenAIAPIError,
+                "安全",
+            ):
+                OpenAIClient(
+                    transport=transport,
+                    base_url="https://compatible.example/v1",
+                ).list_models(api_key)
+            self.assertEqual(transport.calls, [])
+
+    def test_latin1_api_key_can_be_added_to_authorization_header(self) -> None:
+        transport = SequenceTransport({"data": []})
+        OpenAIClient(
+            transport=transport,
+            base_url="https://compatible.example/v1",
+        ).list_models("clé")
+        self.assertEqual(
+            transport.calls[0]["headers"]["Authorization"],
+            "Bearer clé",
+        )
 
     def test_future_o_series_models_are_kept_but_non_text_variants_are_filtered(self) -> None:
         transport = SequenceTransport(
@@ -575,6 +981,67 @@ class OpenAIModelTests(unittest.TestCase):
             with self.subTest(response=response):
                 with self.assertRaises(OpenAIAPIError):
                     OpenAIClient(transport=SequenceTransport(response)).list_models("key")
+
+    def test_final_api_error_message_and_request_id_redact_api_key(self) -> None:
+        api_key = "secret-compatible-key-123456"
+        provider_error = OpenAIAPIError(
+            f"401 rejected token {api_key}",
+            status=401,
+            request_id=f"request-{api_key}",
+            debug_body={"apiKey": api_key},
+        )
+        provider_error.__cause__ = ValueError(f"upstream leaked {api_key}")
+        transport = SequenceTransport(
+            provider_error
+        )
+
+        with self.assertRaises(OpenAIAPIError) as caught:
+            OpenAIClient(transport=transport, max_retries=0).list_models(api_key)
+
+        self.assertNotIn(api_key, str(caught.exception))
+        self.assertNotIn(api_key, caught.exception.request_id)
+        self.assertIn("[API KEY REDACTED]", str(caught.exception))
+        self.assertIn("[API KEY REDACTED]", caught.exception.request_id)
+        formatted = "".join(traceback.format_exception(caught.exception))
+        self.assertNotIn(api_key, formatted)
+        self.assertIsNone(caught.exception.__cause__)
+        if caught.exception.__context__ is not None:
+            context = caught.exception.__context__
+            self.assertNotIn(api_key, str(context))
+            self.assertIsNone(context.__cause__)
+            if isinstance(context, OpenAIAPIError):
+                self.assertNotIn(api_key, context.request_id)
+                self.assertNotIn(
+                    api_key,
+                    json.dumps(context.debug_body, ensure_ascii=True),
+                )
+
+    def test_retry_event_request_id_redacts_api_key(self) -> None:
+        api_key = "secret-retry-key-123456"
+        events: list[OpenAIRetryEvent] = []
+        transport = SequenceTransport(
+            OpenAIAPIError(
+                "rate limited",
+                status=429,
+                request_id=f"retry-{api_key}",
+            ),
+            {"data": []},
+        )
+
+        with patch("mq_localizer.openai_client.time.sleep"):
+            models = OpenAIClient(
+                transport=transport,
+                max_retries=1,
+                on_retry=events.append,
+            ).list_models(api_key)
+
+        self.assertEqual(models, [])
+        self.assertEqual(len(events), 1)
+        self.assertNotIn(api_key, events[0].request_id)
+        self.assertEqual(
+            events[0].request_id,
+            "retry-[API KEY REDACTED]",
+        )
 
     def test_empty_key_and_pre_cancel_do_not_call_transport(self) -> None:
         transport = SequenceTransport({"data": []})
@@ -1082,6 +1549,64 @@ class OpenAIResponseTests(unittest.TestCase):
 
         self.assertEqual(result, {"u1": "翻訳"})
         self.assertEqual(transport.calls[0]["payload"]["service_tier"], "priority")
+
+    def test_compatible_translation_uses_responses_keylessly_without_service_tier(
+        self,
+    ) -> None:
+        transport = SequenceTransport(
+            _output_text(_plain_translation_payload(u1="互換API翻訳"))
+        )
+        client = OpenAIClient(
+            transport=transport,
+            base_url="http://127.0.0.1:11434/v1/",
+        )
+
+        result = client.translate_batch(
+            "",
+            "local/translator",
+            [{"id": "u1", "text": "source"}],
+            "en_us",
+            "ja_jp",
+            service_tier=FAST_MODE_SERVICE_TIER,
+        )
+
+        self.assertEqual(result, {"u1": "互換API翻訳"})
+        call = transport.calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["url"], "http://127.0.0.1:11434/v1/responses")
+        self.assertNotIn("Authorization", call["headers"])
+        self.assertEqual(call["payload"]["model"], "local/translator")
+        self.assertNotIn("service_tier", call["payload"])
+
+    def test_unsafe_model_id_is_rejected_before_transport(self) -> None:
+        unsafe_models: tuple[object, ...] = (
+            "",
+            "   ",
+            "model\nInjected",
+            "model\x85Injected",
+            "model\u200bInjected",
+            "model\u2028Injected",
+            "x" * 513,
+            "\ud800",
+            None,
+        )
+        for model in unsafe_models:
+            transport = SequenceTransport(_output_text({}))
+            with self.subTest(model=model), self.assertRaisesRegex(
+                TranslationError,
+                "モデルID",
+            ):
+                OpenAIClient(
+                    transport=transport,
+                    base_url="https://compatible.example/v1",
+                ).translate_batch(
+                    "",
+                    model,  # type: ignore[arg-type]
+                    [{"id": "u1", "text": "source"}],
+                    "en_us",
+                    "ja_jp",
+                )
+            self.assertEqual(transport.calls, [])
 
     def test_unknown_translation_service_tier_is_rejected_before_transport(self) -> None:
         transport = SequenceTransport(_output_text({}))
@@ -1836,6 +2361,72 @@ class OpenAIResponseTests(unittest.TestCase):
                 self.assertIn(expected_detail, message)
                 self.assertNotIn(secret, message)
                 self.assertNotIn("sk-proj-other-secret-123456", message)
+
+    def test_missing_status_does_not_override_error_or_incomplete_markers(self) -> None:
+        valid_output = json.dumps(
+            _plain_translation_payload(u1="採用してはいけない翻訳"),
+            ensure_ascii=False,
+        )
+        cases = (
+            {
+                "error": {"code": "provider_error", "message": "failed"},
+                "output_text": valid_output,
+            },
+            {
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output_text": valid_output,
+            },
+        )
+
+        for response in cases:
+            with self.subTest(response=response), self.assertRaisesRegex(
+                TranslationError,
+                "status=missing",
+            ):
+                OpenAIClient(
+                    transport=SequenceTransport(response),
+                    max_retries=0,
+                ).translate_batch(
+                    "key",
+                    "gpt-test",
+                    [{"id": "u1", "text": "source"}],
+                    "en_us",
+                    "ja_jp",
+                )
+
+    def test_completed_status_rejects_contradictory_failure_markers(self) -> None:
+        valid_output = json.dumps(
+            _plain_translation_payload(u1="採用してはいけない翻訳"),
+            ensure_ascii=False,
+        )
+        cases = (
+            {
+                "status": "completed",
+                "error": {"code": "provider_error", "message": "failed"},
+                "output_text": valid_output,
+            },
+            {
+                "status": "completed",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output_text": valid_output,
+            },
+        )
+
+        for response in cases:
+            with self.subTest(response=response), self.assertRaisesRegex(
+                TranslationError,
+                "矛盾",
+            ):
+                OpenAIClient(
+                    transport=SequenceTransport(response),
+                    max_retries=0,
+                ).translate_batch(
+                    "key",
+                    "gpt-test",
+                    [{"id": "u1", "text": "source"}],
+                    "en_us",
+                    "ja_jp",
+                )
 
     def test_completed_refusal_stops_without_becoming_a_protocol_error(self) -> None:
         secret = "custom-secret-value-123456"

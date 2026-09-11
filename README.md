@@ -1,15 +1,15 @@
 # Minecraft Quest Localizer
 
-MinecraftのModpackで使われるFTB Questsを、OpenAI APIで翻訳するローカルGUIツールです。ModpackのインスタンスルートからMinecraftバージョン、FTB Quests形式、翻訳元、出力先を自動判定します。
+MinecraftのModpackで使われるFTB Questsを、OpenAI公式APIまたはResponses API互換サービスで翻訳するローカルGUIツールです。ModpackのインスタンスルートからMinecraftバージョン、FTB Quests形式、翻訳元、出力先を自動判定します。
 
 選択した項目の翻訳結果だけを翻訳先localeへ書きます。1.20.x以前の直書きquest SNBTだけは、locale化のため原本を `quests.bak` へ保存し、キー化した `quests` を作ります。
 
 ## 必要なもの
 
 - ソースから起動する場合はPython 3.11以降（外部Pythonパッケージは不要）
-- OpenAI APIキー
+- OpenAI公式APIを使う場合はOpenAI APIキー（互換APIでは接続先の要件に従います）
 
-解析はAPIキーなしでも実行できますが、翻訳開始にはOpenAI APIキーと使用モデルの選択が必要です。API利用料金はOpenAIのアカウントと選択モデルに依存します。
+解析はAPI設定なしでも実行できます。翻訳開始には送信先とモデルIDが必要で、OpenAI公式APIではAPIキーも必要です。料金やデータの取扱いは選択した送信先に依存します。
 
 ## 対応形式
 
@@ -37,8 +37,8 @@ packageとしての起動方法は[開発ドキュメント](docs/development.md
 
 ## 使い方
 
-1. 「設定…」の「OpenAI」タブでAPIキーを入力します。
-2. 「利用可能なモデルを取得」を押し、使用するモデルを選択して保存します。
+1. 「設定…」の「OpenAI」タブでAPIベースURLと、必要な場合はAPIキーを入力します。
+2. 「利用可能なモデルを取得」を押してモデルを選びます。互換APIではモデルIDを直接入力することもできます。
 3. 「インスタンスルート」に `config`、`mods` 等が入っているModpackのフォルダーを1つ選びます。
 4. 設定で原文・翻訳先locale、メイン画面で翻訳する項目を選びます。
 5. 「解析」を押し、検出形式、翻訳元、出力先、固有名詞保護、確認事項を読みます。
@@ -58,7 +58,7 @@ Minecraft本体、Mod、KubeJS、および任意でresource packの言語資産�
 - URL、command、resource ID、quest ID
 - raw JSON text componentの構造、style、click / hover event
 
-OpenAIの応答を安全に復元できない場合は対象項目を再試行し、最終的に検証できなければ翻訳ファイルへ書きません。
+APIの応答を安全に復元できない場合は対象項目を再試行し、最終的に検証できなければ翻訳ファイルへ書きません。
 
 ## 詳細ドキュメント
 

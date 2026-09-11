@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from mq_localizer.config import AppSettings, SettingsStore  # noqa: E402
 from mq_localizer.categories import DEFAULT_TRANSLATION_CATEGORY_IDS  # noqa: E402
 from mq_localizer.openai_client import (  # noqa: E402
+    DEFAULT_API_BASE_URL,
     DEFAULT_TRANSLATION_PROMPT,
     MAX_TRANSLATION_PROMPT_LENGTH,
 )
@@ -43,6 +45,318 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(settings.translation_prompt, DEFAULT_TRANSLATION_PROMPT)
         self.assertIn("{source_locale}", settings.translation_prompt)
         self.assertIn("{target_locale}", settings.translation_prompt)
+
+    def test_api_endpoint_defaults_are_scoped_to_openai(self) -> None:
+        settings = AppSettings()
+
+        self.assertEqual(settings.api_base_url, DEFAULT_API_BASE_URL)
+        self.assertEqual(settings.cached_models_base_url, DEFAULT_API_BASE_URL)
+        self.assertEqual(settings.api_key_base_url, "")
+
+    def test_legacy_settings_without_endpoint_keep_openai_model_cache(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        store.path.write_text(
+            json.dumps(
+                {
+                    "model": "gpt-legacy",
+                    "cached_models": ["gpt-legacy", "o3"],
+                    "fast_mode": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = store.load()
+
+        self.assertEqual(loaded.api_base_url, DEFAULT_API_BASE_URL)
+        self.assertEqual(loaded.cached_models_base_url, DEFAULT_API_BASE_URL)
+        self.assertEqual(loaded.model, "gpt-legacy")
+        self.assertEqual(loaded.cached_models, ["gpt-legacy", "o3"])
+        self.assertTrue(loaded.fast_mode)
+
+    def test_custom_endpoint_is_normalized_and_disables_fast_mode(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        store.path.write_text(
+            json.dumps(
+                {
+                    "api_base_url": "  https://example.test/openai/v1/  ",
+                    "cached_models_base_url": "https://example.test/openai/v1",
+                    "model": "vendor/model:latest",
+                    "cached_models": ["vendor/model:latest"],
+                    "fast_mode": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = store.load()
+
+        self.assertEqual(loaded.api_base_url, "https://example.test/openai/v1")
+        self.assertEqual(
+            loaded.cached_models_base_url,
+            "https://example.test/openai/v1",
+        )
+        self.assertEqual(loaded.model, "vendor/model:latest")
+        self.assertEqual(loaded.cached_models, ["vendor/model:latest"])
+        self.assertFalse(loaded.fast_mode)
+
+    def test_explicit_invalid_endpoint_fails_closed(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+
+        for invalid in ("", "http://example.test/v1", "not a URL", 42):
+            with self.subTest(invalid=invalid):
+                store.path.write_text(
+                    json.dumps(
+                        {
+                            "api_base_url": invalid,
+                            "cached_models_base_url": DEFAULT_API_BASE_URL,
+                            "model": "must-not-survive",
+                            "cached_models": ["must-not-survive"],
+                            "fast_mode": True,
+                            "save_api_key": True,
+                            "api_key_ciphertext": "c2VjcmV0",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                loaded = store.load()
+
+                self.assertEqual(loaded.api_base_url, "")
+                self.assertEqual(loaded.cached_models_base_url, "")
+                self.assertEqual(loaded.model, "")
+                self.assertEqual(loaded.cached_models, [])
+                self.assertFalse(loaded.fast_mode)
+                self.assertFalse(loaded.save_api_key)
+                self.assertEqual(loaded.api_key_ciphertext, "")
+                self.assertEqual(loaded.api_key_base_url, "")
+
+    def test_model_cache_is_cleared_when_endpoint_scope_differs(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        custom_url = "https://example.test/v1"
+        store.path.write_text(
+            json.dumps(
+                {
+                    "api_base_url": custom_url,
+                    "cached_models_base_url": DEFAULT_API_BASE_URL,
+                    "model": "gpt-from-openai",
+                    "cached_models": ["gpt-from-openai"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = store.load()
+
+        self.assertEqual(loaded.api_base_url, custom_url)
+        self.assertEqual(loaded.cached_models_base_url, custom_url)
+        self.assertEqual(loaded.model, "")
+        self.assertEqual(loaded.cached_models, [])
+
+    def test_unsafe_model_ids_are_not_loaded(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        for field, value in (
+            ("model", "unsafe\nmodel"),
+            ("cached_models", ["safe-model", "unsafe\rmodel"]),
+        ):
+            with self.subTest(field=field):
+                raw = {
+                    "api_base_url": DEFAULT_API_BASE_URL,
+                    "cached_models_base_url": DEFAULT_API_BASE_URL,
+                    "model": "safe-model",
+                    "cached_models": ["safe-model"],
+                }
+                raw[field] = value
+                store.path.write_text(json.dumps(raw), encoding="utf-8")
+
+                loaded = store.load()
+
+                if field == "model":
+                    self.assertEqual(loaded.model, "")
+                    self.assertEqual(loaded.cached_models, ["safe-model"])
+                else:
+                    self.assertEqual(loaded.model, "safe-model")
+                    self.assertEqual(loaded.cached_models, [])
+
+    def test_environment_api_key_is_never_forwarded_to_custom_endpoint(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        environment = {"OPENAI_API_KEY": "sk-environment"}
+
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(store.read_api_key(AppSettings()), "sk-environment")
+            self.assertEqual(
+                store.read_api_key(
+                    AppSettings(api_base_url="https://example.test/v1")
+                ),
+                "",
+            )
+
+    def test_saved_api_key_is_bound_to_its_endpoint(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        ciphertext = base64.b64encode(b"encrypted").decode("ascii")
+        custom_url = "https://example.test/v1"
+        settings = AppSettings(
+            api_base_url=custom_url,
+            save_api_key=True,
+            api_key_ciphertext=ciphertext,
+            api_key_base_url=custom_url,
+        )
+
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch(
+                "mq_localizer.config._dpapi_unprotect",
+                return_value=b"custom-secret",
+            ),
+        ):
+            self.assertEqual(store.read_api_key(settings), "custom-secret")
+            settings.api_base_url = DEFAULT_API_BASE_URL
+            self.assertEqual(store.read_api_key(settings), "")
+
+    def test_disabled_saved_key_is_not_decrypted(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        settings = AppSettings(
+            save_api_key=False,
+            api_key_ciphertext=base64.b64encode(b"encrypted").decode("ascii"),
+            api_key_base_url=DEFAULT_API_BASE_URL,
+        )
+
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("mq_localizer.config._dpapi_unprotect") as unprotect,
+        ):
+            self.assertEqual(store.read_api_key(settings), "")
+
+        unprotect.assert_not_called()
+
+    def test_saved_api_key_scope_mismatch_is_removed_while_loading(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        custom_url = "https://example.test/v1"
+        store.path.write_text(
+            json.dumps(
+                {
+                    "api_base_url": custom_url,
+                    "cached_models_base_url": custom_url,
+                    "save_api_key": True,
+                    "api_key_ciphertext": "c2VjcmV0",
+                    "api_key_base_url": DEFAULT_API_BASE_URL,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = store.load()
+
+        self.assertFalse(loaded.save_api_key)
+        self.assertEqual(loaded.api_key_ciphertext, "")
+        self.assertEqual(loaded.api_key_base_url, "")
+
+    def test_legacy_unscoped_saved_key_is_openai_only(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        ciphertext = base64.b64encode(b"encrypted").decode("ascii")
+        settings = AppSettings(
+            save_api_key=True,
+            api_key_ciphertext=ciphertext,
+            api_key_base_url="",
+        )
+
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch(
+                "mq_localizer.config._dpapi_unprotect",
+                return_value=b"legacy-secret",
+            ),
+        ):
+            self.assertEqual(store.read_api_key(settings), "legacy-secret")
+            settings.api_base_url = "https://example.test/v1"
+            self.assertEqual(store.read_api_key(settings), "")
+
+    def test_legacy_unscoped_key_survives_settings_round_trip_for_openai(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        settings = AppSettings(
+            save_api_key=True,
+            api_key_ciphertext=base64.b64encode(b"encrypted").decode("ascii"),
+            api_key_base_url="",
+        )
+
+        store.save(settings)
+        first_load = store.load()
+        store.save(first_load)
+        second_load = store.load()
+
+        self.assertTrue(first_load.save_api_key)
+        self.assertTrue(second_load.save_api_key)
+        self.assertEqual(first_load.api_key_ciphertext, settings.api_key_ciphertext)
+        self.assertEqual(second_load.api_key_ciphertext, settings.api_key_ciphertext)
+        self.assertEqual(first_load.api_key_base_url, "")
+        self.assertEqual(second_load.api_key_base_url, "")
+
+    def test_set_api_key_records_scope_and_clears_it_when_not_persisted(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        custom_url = "https://example.test/v1"
+        settings = AppSettings(api_base_url=f"{custom_url}/")
+
+        with mock.patch(
+            "mq_localizer.config._dpapi_protect",
+            return_value=b"encrypted",
+        ):
+            store.set_api_key(settings, " custom-secret ", True)
+
+        self.assertTrue(settings.save_api_key)
+        self.assertEqual(settings.api_key_base_url, custom_url)
+        self.assertTrue(settings.api_key_ciphertext)
+
+        store.set_api_key(settings, "custom-secret", False)
+        self.assertFalse(settings.save_api_key)
+        self.assertEqual(settings.api_key_ciphertext, "")
+        self.assertEqual(settings.api_key_base_url, "")
+
+    def test_set_api_key_rejects_controls_and_encryption_failure_fails_closed(
+        self,
+    ) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        settings = AppSettings(
+            save_api_key=True,
+            api_key_ciphertext="old-ciphertext",
+            api_key_base_url=DEFAULT_API_BASE_URL,
+        )
+
+        with (
+            mock.patch("mq_localizer.config._dpapi_protect") as protect,
+            self.assertRaises(ValueError),
+        ):
+            store.set_api_key(settings, "sk-bad-key\n", True)
+
+        protect.assert_not_called()
+        self.assertTrue(settings.save_api_key)
+        self.assertEqual(settings.api_key_ciphertext, "old-ciphertext")
+        self.assertEqual(settings.api_key_base_url, DEFAULT_API_BASE_URL)
+
+        with (
+            mock.patch(
+                "mq_localizer.config._dpapi_protect",
+                side_effect=OSError("encryption failed"),
+            ),
+            self.assertRaises(OSError),
+        ):
+            store.set_api_key(settings, "sk-new", True)
+
+        self.assertFalse(settings.save_api_key)
+        self.assertEqual(settings.api_key_ciphertext, "")
+        self.assertEqual(settings.api_key_base_url, "")
 
     def test_fields_are_validated_independently(self) -> None:
         temporary, store = self.make_store()
@@ -277,6 +591,7 @@ class SettingsStoreTests(unittest.TestCase):
                     "last_source_path": "C:/instance",
                     "last_mods_path": "C:/instance/mods",
                     "last_output_path": "C:/old-output",
+                    "api_mode": "chat_completions",
                 }
             ),
             encoding="utf-8",
@@ -288,11 +603,13 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(loaded.last_source_path, "C:/instance")
         self.assertFalse(hasattr(loaded, "last_mods_path"))
         self.assertFalse(hasattr(loaded, "last_output_path"))
+        self.assertFalse(hasattr(loaded, "api_mode"))
 
         store.save(loaded)
         rewritten = json.loads(store.path.read_text(encoding="utf-8"))
         self.assertNotIn("last_mods_path", rewritten)
         self.assertNotIn("last_output_path", rewritten)
+        self.assertNotIn("api_mode", rewritten)
 
     def test_valid_unknown_locales_are_preserved_and_invalid_pairs_fall_back(self) -> None:
         temporary, store = self.make_store()

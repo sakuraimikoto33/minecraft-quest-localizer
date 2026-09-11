@@ -869,6 +869,17 @@ class UiSecurityHelperTests(unittest.TestCase):
             ),
             ["gpt-selected", "o3"],
         )
+        self.assertEqual(
+            _model_candidates(
+                AppSettings(
+                    api_base_url="https://compatible.example/v1",
+                    model="gpt-from-openai",
+                    cached_models=["gpt-from-openai"],
+                    cached_models_base_url="https://api.openai.com/v1",
+                )
+            ),
+            [],
+        )
 
     def test_window_size_is_bounded_by_screen_margin(self) -> None:
         self.assertEqual(
@@ -1037,6 +1048,12 @@ class SettingsPromptTests(unittest.TestCase):
         ):
             self.assertTrue(_api_key_is_environment_value("sk-environment-key"))
             self.assertFalse(_api_key_is_environment_value("sk-session-key"))
+            self.assertFalse(
+                _api_key_is_environment_value(
+                    "sk-environment-key",
+                    "https://compatible.example/v1",
+                )
+            )
         self.assertFalse(
             _save_api_key_initially_selected(settings, True, True)
         )
@@ -1105,6 +1122,115 @@ class SettingsPromptTests(unittest.TestCase):
         self.assertEqual(configured, [{"values": ["gpt-new", "o3"]}])
         self.assertEqual(fetching, [False])
         self.assertIn("2 件", dialog.status_var.get())
+
+    def test_model_fetch_result_is_discarded_after_endpoint_change(self) -> None:
+        dialog = object.__new__(SettingsDialog)
+        dialog.window = _FakeWindow()  # type: ignore[assignment]
+        dialog.api_base_url_var = _FakeStringVar(  # type: ignore[assignment]
+            "https://compatible.example/v1"
+        )
+        dialog.api_key_var = _FakeStringVar("same-key")  # type: ignore[assignment]
+        dialog.model_var = _FakeStringVar("manual-model")  # type: ignore[assignment]
+        dialog.status_var = _FakeStringVar()  # type: ignore[assignment]
+        dialog.models = ["manual-model"]
+        fetching: list[bool] = []
+        dialog._set_fetching = lambda value: fetching.append(value)  # type: ignore[method-assign]
+
+        dialog._models_loaded(
+            "same-key",
+            [ModelInfo("gpt-from-old-endpoint")],
+            "https://api.openai.com/v1",
+        )
+
+        self.assertEqual(dialog.models, ["manual-model"])
+        self.assertEqual(dialog.model_var.get(), "manual-model")
+        self.assertEqual(fetching, [False])
+        self.assertIn("送信先が変更", dialog.status_var.get())
+
+    def test_endpoint_change_clears_endpoint_bound_values(self) -> None:
+        dialog = object.__new__(SettingsDialog)
+        dialog.api_base_url_var = _FakeStringVar(  # type: ignore[assignment]
+            "https://compatible.example/v1"
+        )
+        dialog._api_base_url_identity = dialog._endpoint_identity(
+            "https://api.openai.com/v1"
+        )
+        dialog.model_cancel_event = Event()
+        dialog.api_key_var = _FakeStringVar("sk-old")  # type: ignore[assignment]
+        dialog.save_key_var = _FakeStringVar(True)  # type: ignore[assignment]
+        dialog.api_key_from_environment = True
+        dialog._initial_api_key = "sk-old"
+        dialog.models = ["gpt-old"]
+        dialog.model_var = _FakeStringVar("gpt-old")  # type: ignore[assignment]
+        dialog.fast_mode_var = _FakeStringVar(True)  # type: ignore[assignment]
+        dialog.status_var = _FakeStringVar()  # type: ignore[assignment]
+        dialog.fetching = False
+        configured: list[dict[str, object]] = []
+        dialog.model_combo = SimpleNamespace(  # type: ignore[assignment]
+            configure=lambda **kwargs: configured.append(kwargs)
+        )
+
+        dialog._api_base_url_changed()
+
+        self.assertTrue(dialog.model_cancel_event.is_set())
+        self.assertEqual(dialog.api_key_var.get(), "")
+        self.assertFalse(dialog.save_key_var.get())
+        self.assertEqual(dialog.models, [])
+        self.assertEqual(dialog.model_var.get(), "")
+        self.assertFalse(dialog.fast_mode_var.get())
+        self.assertIn({"values": ()}, configured)
+        self.assertIn({"state": "normal"}, configured)
+        self.assertIn("モデルIDを直接入力", dialog.status_var.get())
+
+    def test_compatible_endpoint_can_fetch_models_without_api_key(self) -> None:
+        dialog = object.__new__(SettingsDialog)
+        dialog.window = object()
+        dialog.api_base_url_var = _FakeStringVar(  # type: ignore[assignment]
+            "https://compatible.example/v1"
+        )
+        dialog.api_key_var = _FakeStringVar("")  # type: ignore[assignment]
+        dialog.timeout_var = _FakeStringVar(45)  # type: ignore[assignment]
+        dialog.retry_var = _FakeStringVar(2)  # type: ignore[assignment]
+        dialog.status_var = _FakeStringVar()  # type: ignore[assignment]
+        dialog.settings = AppSettings(debug_logging=False)
+        dialog.model_cancel_event = Event()
+        dialog.model_events = Queue()
+        dialog._set_fetching = lambda _value: None  # type: ignore[method-assign]
+        observed_options: list[dict[str, object]] = []
+        observed_keys: list[str] = []
+
+        class FakeOpenAIClient:
+            def __init__(self, **kwargs: object) -> None:
+                observed_options.append(kwargs)
+
+            def list_models(self, api_key: str, _cancel: Event) -> list[object]:
+                observed_keys.append(api_key)
+                return []
+
+        class ImmediateThread:
+            def __init__(self, target: object, **_kwargs: object) -> None:
+                self.target = target
+
+            def start(self) -> None:
+                assert callable(self.target)
+                self.target()
+
+        with (
+            patch("mq_localizer.ui.OpenAIClient", FakeOpenAIClient),
+            patch("mq_localizer.ui.threading.Thread", ImmediateThread),
+            patch("mq_localizer.ui.messagebox.showwarning") as warning,
+        ):
+            dialog._fetch_models()
+
+        warning.assert_not_called()
+        self.assertEqual(observed_keys, [""])
+        self.assertEqual(
+            observed_options[0]["base_url"],
+            "https://compatible.example/v1",
+        )
+        event, payload = dialog.model_events.get_nowait()
+        self.assertEqual(event, "loaded")
+        self.assertEqual(payload[:2], ("", "https://compatible.example/v1"))
 
     def test_model_fetch_failure_is_redacted_and_forwarded_to_session_log(self) -> None:
         dialog = object.__new__(SettingsDialog)
@@ -1390,6 +1516,56 @@ class SettingsPromptTests(unittest.TestCase):
             self.assertTrue(saved[0].scan_resourcepacks)
             self.assertTrue(saved[0].skip_glossary_confirmation)
 
+    def test_keyless_compatible_endpoint_accepts_manual_model_and_disables_fast_mode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = object.__new__(SettingsDialog)
+            dialog.window = object()
+            dialog.api_base_url_var = _FakeStringVar(  # type: ignore[assignment]
+                "https://compatible.example/v1/"
+            )
+            dialog.api_key_var = _FakeStringVar("")  # type: ignore[assignment]
+            dialog.model_var = _FakeStringVar("provider/model")  # type: ignore[assignment]
+            dialog.fast_mode_var = _FakeStringVar(True)  # type: ignore[assignment]
+            dialog.batch_var = _FakeStringVar(24)  # type: ignore[assignment]
+            dialog.char_limit_var = _FakeStringVar(9000)  # type: ignore[assignment]
+            dialog.timeout_var = _FakeStringVar(120)  # type: ignore[assignment]
+            dialog.retry_var = _FakeStringVar(3)  # type: ignore[assignment]
+            dialog.save_key_var = _FakeStringVar(False)  # type: ignore[assignment]
+            dialog.prompt_text = _FakePromptText(DEFAULT_TRANSLATION_PROMPT)  # type: ignore[assignment]
+            dialog.models = []
+            dialog.settings = AppSettings()
+            dialog.store = SettingsStore(Path(directory) / "settings.json")
+            saved: list[tuple[str, AppSettings]] = []
+            dialog.on_save = lambda key, settings: saved.append(  # type: ignore[assignment]
+                (key, _copy_settings(settings))
+            )
+            dialog._close = lambda: None  # type: ignore[method-assign]
+
+            with (
+                patch("mq_localizer.ui.messagebox.showwarning") as warning,
+                patch("mq_localizer.ui.messagebox.showerror") as error,
+            ):
+                dialog._save()
+
+            warning.assert_not_called()
+            error.assert_not_called()
+            self.assertEqual(len(saved), 1)
+            api_key, settings = saved[0]
+            self.assertEqual(api_key, "")
+            self.assertEqual(
+                settings.api_base_url,
+                "https://compatible.example/v1",
+            )
+            self.assertEqual(settings.model, "provider/model")
+            self.assertEqual(settings.cached_models, ["provider/model"])
+            self.assertEqual(
+                settings.cached_models_base_url,
+                "https://compatible.example/v1",
+            )
+            self.assertFalse(settings.fast_mode)
+
     def test_same_source_and_target_locale_are_rejected_without_mutation(self) -> None:
         dialog = object.__new__(SettingsDialog)
         dialog.window = object()
@@ -1531,16 +1707,31 @@ class SettingsPromptTests(unittest.TestCase):
 
     def test_settings_button_opens_openai_until_api_key_and_model_exist(self) -> None:
         cases = (
-            ("", "", "openai"),
-            ("sk-current-key", "", "openai"),
-            ("", "gpt-test", "openai"),
-            ("sk-current-key", "gpt-test", "translation"),
+            ("https://api.openai.com/v1", "", "", "openai"),
+            ("https://api.openai.com/v1", "sk-current-key", "", "openai"),
+            ("https://api.openai.com/v1", "", "gpt-test", "openai"),
+            (
+                "https://api.openai.com/v1",
+                "sk-current-key",
+                "gpt-test",
+                "translation",
+            ),
+            ("https://compatible.example/v1", "", "local-model", "translation"),
+            ("", "", "local-model", "openai"),
         )
-        for api_key, model, expected_tab in cases:
-            with self.subTest(api_key=bool(api_key), model=bool(model)):
+        for api_base_url, api_key, model, expected_tab in cases:
+            with self.subTest(
+                api_base_url=api_base_url,
+                api_key=bool(api_key),
+                model=bool(model),
+            ):
                 main = object.__new__(MainWindow)
                 main.root = object()  # type: ignore[assignment]
-                main.settings = AppSettings(model=model)
+                main.settings = AppSettings(
+                    api_base_url=api_base_url,
+                    model=model,
+                    cached_models_base_url=api_base_url,
+                )
                 main.session_api_key = api_key
                 main.store = object()  # type: ignore[assignment]
                 main._append_log = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
@@ -1663,6 +1854,22 @@ class SettingsPromptTests(unittest.TestCase):
         self.assertEqual(invalidations, [True])
         self.assertTrue(main.settings.preserve_existing)
         self.assertFalse(main.settings.skip_glossary_confirmation)
+
+        endpoint_only_change = _copy_settings(main.settings)
+        endpoint_only_change.api_base_url = "https://compatible.example/v1"
+        endpoint_only_change.cached_models_base_url = (
+            "https://compatible.example/v1"
+        )
+        endpoint_only_change.model = "provider/model"
+        endpoint_only_change.cached_models = ["provider/model"]
+        endpoint_only_change.fast_mode = False
+        main._settings_updated("", endpoint_only_change)
+
+        self.assertEqual(invalidations, [True])
+        self.assertEqual(
+            main.settings.api_base_url,
+            "https://compatible.example/v1",
+        )
 
         debug_end_messages: list[str] = []
         main.debug_log = SimpleNamespace(  # type: ignore[assignment]
@@ -2835,6 +3042,15 @@ class HighDpiLayoutTests(unittest.TestCase):
                 )
             )
             self.assertFalse(any("README" in text for text in dialog_widget_texts))
+            self.assertIn("APIベースURL", dialog_widget_texts)
+            self.assertIn("OpenAI公式へ戻す", dialog_widget_texts)
+            self.assertTrue(
+                any(
+                    "入力したAPIキー、翻訳対象、プロンプト" in text
+                    and "/responses は付けません" in text
+                    for text in dialog_widget_texts
+                )
+            )
             self.assertIn("Fast Modeを使用", dialog_widget_texts)
             self.assertIn("デバッグログを出力する", dialog_widget_texts)
             self.assertTrue(
@@ -2969,6 +3185,10 @@ class HighDpiLayoutTests(unittest.TestCase):
                 dialog._fetch_models()
             self.assertEqual(observed_cancel, [dialog.model_cancel_event])
             self.assertEqual(len(observed_client_options), 1)
+            self.assertEqual(
+                observed_client_options[0]["base_url"],
+                "https://api.openai.com/v1",
+            )
             self.assertEqual(observed_client_options[0]["timeout"], 120)
             self.assertEqual(observed_client_options[0]["max_retries"], 3)
             self.assertTrue(callable(observed_client_options[0]["on_retry"]))

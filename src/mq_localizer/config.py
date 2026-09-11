@@ -13,9 +13,13 @@ from typing import Any
 from .categories import DEFAULT_TRANSLATION_CATEGORY_IDS, FTB_TRANSLATION_CATEGORIES
 from .io_utils import atomic_write_text
 from .openai_client import (
+    DEFAULT_API_BASE_URL,
     DEFAULT_TRANSLATION_PROMPT,
     LEGACY_DEFAULT_TRANSLATION_PROMPTS,
     MAX_TRANSLATION_PROMPT_LENGTH,
+    is_official_api_base_url,
+    is_safe_model_id,
+    normalize_api_base_url,
 )
 from .scan_limits import GlossaryScanLimits
 
@@ -36,8 +40,10 @@ def default_config_dir() -> Path:
 
 @dataclass(slots=True)
 class AppSettings:
+    api_base_url: str = DEFAULT_API_BASE_URL
     model: str = ""
     cached_models: list[str] = field(default_factory=list)
+    cached_models_base_url: str = DEFAULT_API_BASE_URL
     fast_mode: bool = False
     debug_logging: bool = False
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT
@@ -62,6 +68,7 @@ class AppSettings:
     )
     save_api_key: bool = False
     api_key_ciphertext: str = ""
+    api_key_base_url: str = ""
     last_source_path: str = ""
 
     @property
@@ -103,10 +110,25 @@ class SettingsStore:
         atomic_write_text(self.path, payload, encoding="utf-8")
 
     def read_api_key(self, settings: AppSettings) -> str:
-        environment_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if environment_key:
-            return environment_key
-        if not settings.api_key_ciphertext:
+        try:
+            api_base_url = normalize_api_base_url(settings.api_base_url)
+        except (TypeError, ValueError):
+            return ""
+        if is_official_api_base_url(api_base_url):
+            environment_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if environment_key:
+                return environment_key
+        if not settings.save_api_key or not settings.api_key_ciphertext:
+            return ""
+        if settings.api_key_base_url:
+            try:
+                key_base_url = normalize_api_base_url(settings.api_key_base_url)
+            except (TypeError, ValueError):
+                return ""
+            if key_base_url != api_base_url:
+                return ""
+        elif not is_official_api_base_url(api_base_url):
+            # Keys saved before endpoint scoping existed belong to OpenAI only.
             return ""
         try:
             encrypted = base64.b64decode(settings.api_key_ciphertext, validate=True)
@@ -115,13 +137,23 @@ class SettingsStore:
             return ""
 
     def set_api_key(self, settings: AppSettings, api_key: str, persist: bool) -> None:
+        if any(ord(character) < 32 or ord(character) == 127 for character in api_key):
+            raise ValueError("API key に制御文字を含めることはできません")
         api_key = api_key.strip()
-        settings.save_api_key = bool(persist and api_key)
-        if not settings.save_api_key:
-            settings.api_key_ciphertext = ""
+        try:
+            api_base_url = normalize_api_base_url(settings.api_base_url)
+        except (TypeError, ValueError):
+            api_base_url = ""
+        should_save = bool(persist and api_key and api_base_url)
+        settings.save_api_key = False
+        settings.api_key_ciphertext = ""
+        settings.api_key_base_url = ""
+        if not should_save:
             return
         encrypted = _dpapi_protect(api_key.encode("utf-8"))
+        settings.save_api_key = True
         settings.api_key_ciphertext = base64.b64encode(encrypted).decode("ascii")
+        settings.api_key_base_url = api_base_url
 
     @property
     def secure_persistence_available(self) -> bool:
@@ -137,12 +169,31 @@ def _validated_settings(raw: dict[str, Any]) -> AppSettings:
 
     defaults = AppSettings()
     result = AppSettings()
-    short_strings = ("model", "adapter_id")
+    api_base_url_present = "api_base_url" in raw
+    api_base_url_value = raw.get("api_base_url", defaults.api_base_url)
+    api_base_url_valid = False
+    if isinstance(api_base_url_value, str):
+        try:
+            result.api_base_url = normalize_api_base_url(api_base_url_value)
+        except ValueError:
+            result.api_base_url = ""
+        else:
+            api_base_url_valid = True
+    else:
+        result.api_base_url = ""
+
+    # A missing field is the legacy OpenAI configuration. An explicitly invalid
+    # field must not silently redirect saved credentials or content to OpenAI.
+    if not api_base_url_present:
+        result.api_base_url = DEFAULT_API_BASE_URL
+        api_base_url_valid = True
+
+    short_strings = ("adapter_id",)
     path_strings = ("last_source_path",)
     for name in short_strings:
         value = raw.get(name, getattr(defaults, name))
         if isinstance(value, str) and len(value) <= 512:
-            setattr(result, name, value.strip() if name == "model" else value)
+            setattr(result, name, value)
     minecraft_version = raw.get("minecraft_version", defaults.minecraft_version)
     if (
         isinstance(minecraft_version, str)
@@ -221,19 +272,53 @@ def _validated_settings(raw: dict[str, Any]) -> AppSettings:
         result.glossary_max_source_language_mib = limits.max_source_language_mib
         result.glossary_max_total_language_mib = limits.max_total_language_mib
 
-    cached_models = raw.get("cached_models", defaults.cached_models)
-    if (
-        isinstance(cached_models, list)
-        and len(cached_models) <= MAX_CACHED_MODEL_COUNT
-        and all(
-            isinstance(model, str)
-            and bool(model.strip())
-            and len(model) <= 512
-            for model in cached_models
-        )
-    ):
-        result.cached_models = list(
-            dict.fromkeys(model.strip() for model in cached_models)
+    cached_models_base_url_value = raw.get(
+        "cached_models_base_url", defaults.cached_models_base_url
+    )
+    cached_models_base_url_valid = False
+    if isinstance(cached_models_base_url_value, str):
+        try:
+            cached_models_base_url = normalize_api_base_url(
+                cached_models_base_url_value
+            )
+        except ValueError:
+            cached_models_base_url = ""
+        else:
+            cached_models_base_url_valid = True
+    else:
+        cached_models_base_url = ""
+
+    cache_matches_endpoint = (
+        api_base_url_valid
+        and cached_models_base_url_valid
+        and cached_models_base_url == result.api_base_url
+    )
+    if cache_matches_endpoint:
+        result.cached_models_base_url = cached_models_base_url
+        model = raw.get("model", defaults.model)
+        if isinstance(model, str):
+            normalized_model = model.strip()
+            if not normalized_model or is_safe_model_id(normalized_model):
+                result.model = normalized_model
+
+        cached_models = raw.get("cached_models", defaults.cached_models)
+        if (
+            isinstance(cached_models, list)
+            and len(cached_models) <= MAX_CACHED_MODEL_COUNT
+            and all(
+                isinstance(model, str)
+                and is_safe_model_id(model.strip())
+                for model in cached_models
+            )
+        ):
+            result.cached_models = list(
+                dict.fromkeys(model.strip() for model in cached_models)
+            )
+    else:
+        result.model = ""
+        result.cached_models = []
+        result.cached_models_base_url = (
+            result.api_base_url if api_base_url_valid else ""
         )
 
     for name in (
@@ -261,6 +346,48 @@ def _validated_settings(raw: dict[str, Any]) -> AppSettings:
     ciphertext = raw.get("api_key_ciphertext", "")
     if result.save_api_key and isinstance(ciphertext, str) and len(ciphertext) <= 65536:
         result.api_key_ciphertext = ciphertext
+    api_key_base_url_value = raw.get("api_key_base_url", "")
+    api_key_is_legacy_unscoped = api_key_base_url_value == ""
+    api_key_base_url = ""
+    api_key_base_url_valid = False
+    if isinstance(api_key_base_url_value, str) and api_key_base_url_value:
+        try:
+            api_key_base_url = normalize_api_base_url(api_key_base_url_value)
+        except ValueError:
+            pass
+        else:
+            api_key_base_url_valid = True
+
+    key_scope_matches_endpoint = (
+        api_base_url_valid
+        and (
+            (
+                api_key_base_url_valid
+                and api_key_base_url == result.api_base_url
+            )
+            or (
+                api_key_is_legacy_unscoped
+                and is_official_api_base_url(result.api_base_url)
+            )
+        )
+    )
+    if result.api_key_ciphertext and key_scope_matches_endpoint:
+        result.api_key_base_url = api_key_base_url
+    else:
+        result.save_api_key = False
+        result.api_key_ciphertext = ""
+        result.api_key_base_url = ""
+
+    if not api_base_url_valid:
+        result.model = ""
+        result.cached_models = []
+        result.cached_models_base_url = ""
+        result.fast_mode = False
+        result.save_api_key = False
+        result.api_key_ciphertext = ""
+        result.api_key_base_url = ""
+    elif not is_official_api_base_url(result.api_base_url):
+        result.fast_mode = False
     return result
 
 

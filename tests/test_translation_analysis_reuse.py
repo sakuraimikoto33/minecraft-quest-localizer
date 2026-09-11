@@ -352,6 +352,56 @@ class TranslationAnalysisReuseTests(unittest.TestCase):
                 all(cancel is case.main.cancel_event for _, cancel in glossary_checks)
             )
 
+    def test_keyless_compatible_endpoint_is_passed_to_responses_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case = self._analyze_once(directory)
+            workers = self._prepare_translation(case)
+            case.main.session_api_key = ""
+            case.main.settings.api_base_url = "https://compatible.example/v1/"
+            case.main.settings.cached_models_base_url = (
+                "https://compatible.example/v1"
+            )
+            case.main.settings.model = "provider/model"
+            case.main.settings.fast_mode = True
+            logged: list[str] = []
+            case.main._append_log = (  # type: ignore[method-assign]
+                lambda message, *_args, **_kwargs: logged.append(message)
+            )
+            client_options: list[dict[str, object]] = []
+            service_calls: list[dict[str, Any]] = []
+
+            def make_client(**kwargs: object) -> object:
+                client_options.append(kwargs)
+                return object()
+
+            with (
+                patch("mq_localizer.ui.inspect_instance_root", return_value=case.instance),
+                patch("mq_localizer.ui.assert_glossary_inputs_unchanged"),
+                patch("mq_localizer.ui.OpenAIClient", side_effect=make_client),
+                patch(
+                    "mq_localizer.ui.TranslationService",
+                    self._service(service_calls),
+                ),
+            ):
+                case.main._translate()
+                self.assertEqual(len(workers), 1)
+                workers[0]()
+
+            self.assertEqual(len(client_options), 1)
+            self.assertEqual(
+                client_options[0]["base_url"],
+                "https://compatible.example/v1",
+            )
+            self.assertEqual(service_calls[0]["api_key"], "")
+            self.assertEqual(service_calls[0]["model"], "provider/model")
+            self.assertFalse(service_calls[0]["fast_mode"])
+            self.assertTrue(
+                any(
+                    "API送信先: https://compatible.example/v1" in message
+                    for message in logged
+                )
+            )
+
     def test_source_changed_after_analysis_is_rejected_before_confirmation_or_api(
         self,
     ) -> None:

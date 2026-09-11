@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import queue
 import re
 import socket
 import ssl
+import string
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
@@ -28,6 +31,9 @@ DEFAULT_TRANSLATION_PROMPT = (
     "The application restores the protected values locally. Return one translation for "
     "every input id. Do not add explanations or notes."
 )
+DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
+MAX_API_BASE_URL_LENGTH = 2048
+MAX_MODEL_ID_LENGTH = 512
 # Previous releases persisted their then-default prompt as an ordinary setting.
 # Migrate only an exact old default; user-authored prompts must remain untouched.
 LEGACY_DEFAULT_TRANSLATION_PROMPTS = (
@@ -83,21 +89,29 @@ _MQP_LIKE_PATTERN = re.compile(
 _CONFIDENTIAL_DEBUG_FIELDS = frozenset(
     {
         "authorization",
-        "proxy_authorization",
+        "proxyauthorization",
         "cookie",
-        "set_cookie",
-        "x_api_key",
-        "api_key",
-        "access_token",
-        "refresh_token",
-        "client_secret",
+        "setcookie",
+        "xapikey",
+        "xauthtoken",
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "clientsecret",
         "password",
     }
 )
+_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN = r"[-_.\s]*"
 _CONFIDENTIAL_DEBUG_FIELD_PATTERN = (
-    r"(?:authorization|proxy[-_]authorization|cookie|set[-_]cookie|"
-    r"x[-_]api[-_]key|api[-_]key|access[-_]token|refresh[-_]token|"
-    r"client[-_]secret|password)"
+    rf"(?:authorization|proxy{_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN}authorization|"
+    rf"cookie|set{_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN}cookie|"
+    rf"x{_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN}(?:"
+    rf"api{_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN}key|"
+    rf"auth{_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN}token)|"
+    rf"api{_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN}key|"
+    rf"access{_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN}token|"
+    rf"refresh{_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN}token|"
+    rf"client{_CONFIDENTIAL_FIELD_SEPARATOR_PATTERN}secret|password)"
 )
 _JSON_STRING_PATTERN = r'"(?:\\.|[^"\\])*"'
 _EMBEDDED_CONFIDENTIAL_JSON_PREFIX_PATTERN = re.compile(
@@ -235,6 +249,305 @@ class OpenAIRefusalError(TranslationError):
     """A completed response explicitly refused to produce the translation."""
 
 
+def normalize_api_base_url(value: str) -> str:
+    """Validate and normalize the root URL of a Responses-compatible API.
+
+    Remote endpoints must use HTTPS. Plain HTTP is accepted only for an
+    explicit localhost or loopback address so a locally hosted provider remains
+    usable without making API keys available to an unencrypted remote server.
+    """
+
+    if not isinstance(value, str):
+        raise ValueError("API base URL は文字列で指定してください")
+    if len(value) > MAX_API_BASE_URL_LENGTH:
+        raise ValueError(
+            "API base URL が長すぎます "
+            f"({len(value)}/{MAX_API_BASE_URL_LENGTH})"
+        )
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("API base URL に制御文字を含めることはできません")
+    normalized_input = value.strip()
+    if not normalized_input:
+        raise ValueError("API base URL を入力してください")
+    if any(character.isspace() for character in normalized_input):
+        raise ValueError("API base URL に空白を含めることはできません")
+    if "\\" in normalized_input:
+        raise ValueError("API base URL にバックスラッシュを含めることはできません")
+
+    try:
+        parsed = urllib.parse.urlsplit(normalized_input)
+    except ValueError as exc:
+        raise ValueError("API base URL の形式が正しくありません") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("API base URL は http または https で指定してください")
+    if not parsed.netloc or parsed.hostname is None:
+        raise ValueError("API base URL は絶対URLで指定してください")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("API base URL にユーザー情報を含めることはできません")
+    if parsed.netloc.endswith(":"):
+        raise ValueError("API base URL のportが正しくありません")
+    if parsed.query or parsed.fragment:
+        raise ValueError("API base URL にqueryまたはfragmentを含めることはできません")
+
+    hostname = parsed.hostname.lower()
+    if not hostname or any(ord(character) > 127 for character in hostname):
+        raise ValueError("API base URL のホスト名が正しくありません")
+    if parsed.netloc.startswith("["):
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ValueError as exc:
+            raise ValueError(
+                "API base URL の角括弧内にはIPv6アドレスを指定してください"
+            ) from exc
+    if any(ord(character) > 127 for character in parsed.path):
+        raise ValueError("API base URL のpathにはASCII文字を使用してください")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("API base URL のportが正しくありません") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("API base URL のportが正しくありません")
+    if scheme == "http" and not _is_local_api_hostname(hostname):
+        raise ValueError("リモートAPIのbase URLにはhttpsを使用してください")
+
+    if (scheme, port) in {("https", 443), ("http", 80)}:
+        port = None
+    host_for_url = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = host_for_url if port is None else f"{host_for_url}:{port}"
+    path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((scheme, netloc, path, "", ""))
+
+
+def is_official_api_base_url(value: str) -> bool:
+    """Return whether *value* identifies the exact public OpenAI v1 API root."""
+
+    try:
+        parsed = urllib.parse.urlsplit(normalize_api_base_url(value))
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "api.openai.com"
+        and port in (None, 443)
+        and parsed.path == "/v1"
+    )
+
+
+def is_safe_model_id(value: object) -> bool:
+    """Check a provider model identifier before placing it in JSON or logs."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_MODEL_ID_LENGTH
+        or value != value.strip()
+        or not value.isprintable()
+    ):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _is_http_header_safe(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    return not any(
+        codepoint < 32
+        or codepoint == 127
+        or 128 <= codepoint <= 159
+        or codepoint > 255
+        for codepoint in map(ord, value)
+    )
+
+
+def _is_local_api_hostname(hostname: str) -> bool:
+    if hostname == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
+def _url_origin(url: str) -> tuple[str, str, int] | None:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        hostname = parsed.hostname
+        if hostname is None:
+            return None
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme.lower() == "https":
+        effective_port = 443 if port is None else port
+    elif parsed.scheme.lower() == "http":
+        effective_port = 80 if port is None else port
+    else:
+        return None
+    return parsed.scheme.lower(), hostname.lower(), effective_port
+
+
+class _SameOriginAPIRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep credentials and request bodies inside the configured API origin."""
+
+    def http_error_302(
+        self,
+        request: urllib.request.Request,
+        fp: Any,
+        code: int,
+        message: str,
+        headers: Any,
+    ) -> Any:
+        location = headers.get("location") or headers.get("uri")
+        if location is None:
+            return None
+        if not isinstance(location, str):
+            try:
+                fp.close()
+            finally:
+                raise OpenAIAPIError(
+                    "APIのredirect先が文字列ではありません",
+                    retryable=False,
+                    kind="redirect",
+                )
+
+        try:
+            url_parts = urllib.parse.urlparse(location)
+            if url_parts.scheme.lower() not in {"", "http", "https"}:
+                raise ValueError("unsupported redirect scheme")
+            if not url_parts.path and url_parts.netloc:
+                url_parts = url_parts._replace(path="/")
+            encoded_location = urllib.parse.quote(
+                urllib.parse.urlunparse(url_parts),
+                encoding="iso-8859-1",
+                safe=string.punctuation,
+            )
+            new_url = urllib.parse.urljoin(request.full_url, encoded_location)
+            redirected = self.redirect_request(
+                request,
+                fp,
+                code,
+                message,
+                headers,
+                new_url,
+            )
+        except OpenAIAPIError:
+            fp.close()
+            raise
+        except (UnicodeError, ValueError) as exc:
+            fp.close()
+            raise OpenAIAPIError(
+                "APIのredirect先URLが安全に処理できません",
+                retryable=False,
+                kind="redirect",
+            ) from exc
+        if redirected is None:
+            return None
+
+        if hasattr(request, "redirect_dict"):
+            visited = redirected.redirect_dict = request.redirect_dict
+            if (
+                visited.get(new_url, 0) >= self.max_repeats
+                or len(visited) >= self.max_redirections
+            ):
+                fp.close()
+                raise OpenAIAPIError(
+                    "APIのredirect回数が安全上限を超えました",
+                    retryable=False,
+                    kind="redirect",
+                )
+        else:
+            visited = redirected.redirect_dict = request.redirect_dict = {}
+        visited[new_url] = visited.get(new_url, 0) + 1
+
+        try:
+            _read_limited_response(fp, _MAX_API_RESPONSE_BYTES)
+        finally:
+            fp.close()
+        return self.parent.open(redirected, timeout=request.timeout)
+
+    http_error_301 = http_error_302
+    http_error_303 = http_error_302
+    http_error_307 = http_error_302
+    http_error_308 = http_error_302
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        fp: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> urllib.request.Request | None:
+        if _url_origin(request.full_url) != _url_origin(new_url):
+            raise OpenAIAPIError(
+                "APIが別originへリダイレクトしたため接続を中止しました",
+                retryable=False,
+                kind="redirect",
+            )
+
+        method = request.get_method().upper()
+        if method in {"GET", "HEAD"} and code in {301, 302, 303, 307, 308}:
+            data = None
+        elif method == "POST" and code in {307, 308}:
+            data = request.data
+        else:
+            raise OpenAIAPIError(
+                f"APIの安全でないリダイレクトを拒否しました (HTTP {code}, {method})",
+                retryable=False,
+                kind="redirect",
+            )
+
+        redirected_headers = {
+            name: header_value
+            for name, header_value in request.header_items()
+            if name.lower() not in {"content-length", "host"}
+        }
+        if data is None:
+            redirected_headers = {
+                name: header_value
+                for name, header_value in redirected_headers.items()
+                if name.lower() != "content-type"
+            }
+        return urllib.request.Request(
+            new_url,
+            data=data,
+            headers=redirected_headers,
+            origin_req_host=request.origin_req_host,
+            unverifiable=True,
+            method=method,
+        )
+
+
+def _open_api_request(
+    request: urllib.request.Request,
+    timeout: int,
+) -> Any:
+    handlers: list[Any] = [_SameOriginAPIRedirectHandler()]
+    try:
+        hostname = urllib.parse.urlsplit(request.full_url).hostname
+    except ValueError:
+        hostname = None
+    if hostname is not None and _is_local_api_hostname(hostname.lower()):
+        # Never let environment or OS proxy settings turn a loopback-only HTTP
+        # endpoint into a plaintext remote request carrying credentials/content.
+        handlers.insert(0, urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
+    return opener.open(request, timeout=timeout)
+
+
 class UrllibJsonTransport:
     def request(
         self,
@@ -247,7 +560,7 @@ class UrllibJsonTransport:
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _open_api_request(request, timeout) as response:
                 response_bytes = _read_limited_response(response, _MAX_API_RESPONSE_BYTES)
                 try:
                     response_data = response_bytes.decode("utf-8")
@@ -802,7 +1115,7 @@ class OpenAIClient:
     def __init__(
         self,
         transport: JsonTransport | None = None,
-        base_url: str = "https://api.openai.com/v1",
+        base_url: str = DEFAULT_API_BASE_URL,
         timeout: int = 120,
         max_retries: int = 3,
         translation_prompt: str = DEFAULT_TRANSLATION_PROMPT,
@@ -810,7 +1123,8 @@ class OpenAIClient:
         on_debug: Callable[[str], None] | None = None,
     ) -> None:
         self.transport = transport or UrllibJsonTransport()
-        self.base_url = base_url.rstrip("/")
+        self.base_url = normalize_api_base_url(base_url)
+        self.is_official_endpoint = is_official_api_base_url(self.base_url)
         self.timeout = timeout
         self.max_retries = max(0, max_retries)
         self.on_retry = on_retry
@@ -825,19 +1139,26 @@ class OpenAIClient:
             raise OpenAIAPIError("OpenAI Models API の data が配列ではありません")
         models = []
         for item in data:
-            if isinstance(item, dict) and isinstance(item.get("id"), str) and _is_text_model(item["id"]):
-                created = item.get("created", 0)
-                if type(created) is not int:
+            if not isinstance(item, dict) or not is_safe_model_id(item.get("id")):
+                continue
+            model_id = item["id"]
+            if self.is_official_endpoint and not _is_text_model(model_id):
+                continue
+            created = item.get("created", 0)
+            if type(created) is not int:
+                if self.is_official_endpoint:
                     raise OpenAIAPIError(
-                        f"OpenAI Models API の created が整数ではありません: {item['id']}"
+                        f"OpenAI Models API の created が整数ではありません: {model_id}"
                     )
-                models.append(
-                    ModelInfo(
-                        id=item["id"],
-                        created=created,
-                        owned_by=str(item.get("owned_by", "")),
-                    )
+                created = 0
+            owned_by = item.get("owned_by", "")
+            models.append(
+                ModelInfo(
+                    id=model_id,
+                    created=created,
+                    owned_by=owned_by if isinstance(owned_by, str) else "",
                 )
+            )
         models.sort(key=lambda model: (model.created, model.id), reverse=True)
         return models
 
@@ -856,6 +1177,11 @@ class OpenAIClient:
             raise TranslationError(
                 "翻訳リクエストのservice_tierはpriorityだけを指定できます"
             )
+        if not isinstance(model, str) or not model.isprintable():
+            raise TranslationError("安全に使用できるモデルIDを指定してください")
+        normalized_model = model.strip()
+        if not is_safe_model_id(normalized_model):
+            raise TranslationError("安全に使用できるモデルIDを指定してください")
         structured_items = _prepare_structured_translation_items(items)
         schema = _structured_translation_schema(structured_items)
         property_count = _schema_property_count(schema)
@@ -883,7 +1209,7 @@ class OpenAIClient:
         if is_japanese_locale(target_locale):
             instructions = f"{instructions}\n\n{JAPANESE_UNICODE_INSTRUCTIONS}"
         payload = {
-            "model": model.strip(),
+            "model": normalized_model,
             "instructions": instructions,
             "input": json.dumps(
                 {"items": [item.provider_item for item in structured_items]},
@@ -899,7 +1225,7 @@ class OpenAIClient:
             },
             "store": False,
         }
-        if service_tier is not None:
+        if service_tier is not None and self.is_official_endpoint:
             payload["service_tier"] = service_tier
         body = self._request_with_retries("POST", "/responses", api_key, payload, cancel)
         _require_completed_response(body, api_key)
@@ -928,13 +1254,20 @@ class OpenAIClient:
         payload: dict[str, Any] | None,
         cancel: Event | None,
     ) -> dict[str, Any]:
-        if not api_key.strip():
+        if not _is_http_header_safe(api_key):
+            raise OpenAIAPIError(
+                "APIキーにHTTP headerで安全に使用できない文字が含まれています",
+                401,
+            )
+        normalized_api_key = api_key.strip()
+        if self.is_official_endpoint and not normalized_api_key:
             raise OpenAIAPIError("OpenAI API キーが設定されていません", 401)
         headers = {
-            "Authorization": f"Bearer {api_key.strip()}",
             "Content-Type": "application/json",
             "User-Agent": "minecraft-quest-localizer/0.1",
         }
+        if normalized_api_key:
+            headers["Authorization"] = f"Bearer {normalized_api_key}"
         for attempt in range(self.max_retries + 1):
             if cancel and cancel.is_set():
                 cancelled = CancelledError("処理をキャンセルしました")
@@ -991,15 +1324,39 @@ class OpenAIClient:
                     error=exc,
                 )
                 if not exc.retryable or attempt >= self.max_retries:
-                    suffix = f" (request id: {exc.request_id})" if exc.request_id else ""
+                    safe_request_id = _redact_sensitive(exc.request_id or "", api_key)
+                    safe_message = _redact_sensitive(str(exc), api_key)
+                    suffix = (
+                        f" (request id: {safe_request_id})"
+                        if safe_request_id
+                        else ""
+                    )
+                    try:
+                        safe_debug_body = _redact_debug_value(
+                            exc.debug_body,
+                            api_key,
+                        )
+                    except Exception:
+                        safe_debug_body = (
+                            "[REDACTED]" if exc.debug_body is not None else None
+                        )
+                    # Raising while handling ``exc`` links it as __context__ even
+                    # with ``from None``. Sanitize and truncate its own chain so
+                    # neither formatted tracebacks nor manual chain inspection
+                    # can recover a provider-echoed credential.
+                    exc.args = (safe_message,)
+                    exc.request_id = safe_request_id
+                    exc.debug_body = safe_debug_body
+                    exc.__cause__ = None
+                    exc.__context__ = None
                     raise OpenAIAPIError(
-                        str(exc) + suffix,
+                        safe_message + suffix,
                         exc.status,
-                        exc.request_id,
+                        safe_request_id,
                         retryable=exc.retryable,
                         kind=exc.kind,
-                        debug_body=exc.debug_body,
-                    ) from exc
+                        debug_body=safe_debug_body,
+                    ) from None
                 delay = min(8.0, 1.0 * (2**attempt))
                 retry_event = OpenAIRetryEvent(
                     attempt=attempt + 1,
@@ -1007,7 +1364,7 @@ class OpenAIClient:
                     delay=delay,
                     endpoint=endpoint,
                     status=exc.status,
-                    request_id=exc.request_id,
+                    request_id=_redact_sensitive(exc.request_id or "", api_key),
                     kind=exc.kind,
                 )
                 if self.on_retry is not None:
@@ -1223,14 +1580,20 @@ def _render_translation_prompt(prompt: str, source_locale: str, target_locale: s
 
 def _require_completed_response(body: dict[str, Any], api_key: str) -> None:
     status = body.get("status")
+    has_failure_marker = (
+        body.get("error") is not None
+        or body.get("incomplete_details") is not None
+    )
     if status is None:
         # Some compatible transports and older test doubles omit the optional
-        # status field.  If present, however, only a completed response is safe
-        # to consume.
-        return
+        # status field. An explicit error/incomplete marker must still win over
+        # any output_text a malformed provider happens to return alongside it.
+        if not has_failure_marker:
+            return
     if not isinstance(status, str):
-        raise TranslationError("OpenAI の応答 status が文字列ではありません")
-    if status == "completed":
+        if status is not None:
+            raise TranslationError("OpenAI の応答 status が文字列ではありません")
+    if status == "completed" and not has_failure_marker:
         return
 
     details: list[str] = []
@@ -1248,7 +1611,15 @@ def _require_completed_response(body: dict[str, Any], api_key: str) -> None:
         if isinstance(reason, str) and reason:
             details.append(f"reason={reason}")
     suffix = f": {'; '.join(details)}" if details else ""
-    message = _redact_sensitive(f"OpenAI の応答が完了していません (status={status}){suffix}", api_key)
+    rendered_status = "missing" if status is None else status
+    if status == "completed":
+        message_prefix = "OpenAI の応答が矛盾しています"
+    else:
+        message_prefix = "OpenAI の応答が完了していません"
+    message = _redact_sensitive(
+        f"{message_prefix} (status={rendered_status}){suffix}",
+        api_key,
+    )
     raise TranslationError(message)
 
 
@@ -1377,18 +1748,22 @@ def _render_debug_json_node(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _is_confidential_debug_field(value: object) -> bool:
+    canonical = re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    return canonical in _CONFIDENTIAL_DEBUG_FIELDS
+
+
 def _redact_debug_node(value: Any, api_key: str, depth: int) -> Any:
     if isinstance(value, _DebugJSONObject):
         sanitized_pairs: _DebugJSONObject = _DebugJSONObject()
         for key, child in value:
             rendered_key = str(key)
-            normalized_key = rendered_key.casefold().replace("-", "_")
             safe_key = _redact_sensitive(rendered_key, api_key)
             sanitized_pairs.append(
                 (
                     safe_key,
                     "[REDACTED]"
-                    if normalized_key in _CONFIDENTIAL_DEBUG_FIELDS
+                    if _is_confidential_debug_field(rendered_key)
                     else _redact_debug_node(child, api_key, depth + 1),
                 )
             )
@@ -1397,9 +1772,8 @@ def _redact_debug_node(value: Any, api_key: str, depth: int) -> Any:
         sanitized: dict[str, Any] = {}
         for key, child in value.items():
             rendered_key = str(key)
-            normalized_key = rendered_key.casefold().replace("-", "_")
             safe_key = _redact_sensitive(rendered_key, api_key)
-            if normalized_key in _CONFIDENTIAL_DEBUG_FIELDS:
+            if _is_confidential_debug_field(rendered_key):
                 sanitized[safe_key] = "[REDACTED]"
             else:
                 sanitized[safe_key] = _redact_debug_node(child, api_key, depth + 1)
