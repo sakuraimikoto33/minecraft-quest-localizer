@@ -372,10 +372,10 @@ def _is_local_api_hostname(hostname: str) -> bool:
         address = ipaddress.ip_address(hostname)
     except ValueError:
         return False
-    if address.is_loopback:
+    if address.is_loopback or address.is_private:
         return True
     mapped = getattr(address, "ipv4_mapped", None)
-    return bool(mapped and mapped.is_loopback)
+    return bool(mapped and (mapped.is_loopback or mapped.is_private))
 
 
 def _url_origin(url: str) -> tuple[str, str, int] | None:
