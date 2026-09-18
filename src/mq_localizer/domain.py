@@ -65,3 +65,9 @@ class TranslationOutcome:
     glossary_terms: int
     skipped_by_selection: int = 0
     preserved_unselected: int = 0
+    partial: bool = False
+    written: bool = True
+
+    @property
+    def completed(self) -> int:
+        return self.translated + self.reused + self.copied_without_translation

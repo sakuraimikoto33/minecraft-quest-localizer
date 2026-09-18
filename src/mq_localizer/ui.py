@@ -50,6 +50,7 @@ from .output_guard import (
     assert_source_unchanged,
     snapshot_path,
 )
+from .quota import GROUP_LABELS, QuotaLedger, group_for_model, limits_for_usage_tier
 from .scan_limits import (
     LANGUAGE_FILE_MIB_MAX,
     LANGUAGE_FILE_MIB_MIN,
@@ -61,7 +62,7 @@ from .scan_limits import (
     TOTAL_LANGUAGE_MIB_MIN,
     GlossaryScanLimits,
 )
-from .translator import TranslationOptions, TranslationService, select_translation_units
+from .translator import PartialTranslationState, TranslationOptions, TranslationService, select_translation_units
 
 
 _LOCALE_PATTERN = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$", re.IGNORECASE)
@@ -321,6 +322,17 @@ def _format_translation_completion(
     outcome: TranslationOutcome,
     project: TranslationProject | None = None,
 ) -> str:
+    if outcome.partial:
+        action = (
+            f"{outcome.completed} / {outcome.total} 件を書き込みました。\n出力先: {outcome.output_path}"
+            if outcome.written else
+            f"{outcome.completed} / {outcome.total} 件が完成していましたが、翻訳ファイルには書き込んでいません。"
+        )
+        note = (
+            "\nMinecraftのリソースパック画面で生成したパックを有効化してください。"
+            if outcome.written and project is not None and _resourcepack_activation_required(project) else ""
+        )
+        return f"\n=== 無料枠不足による途中終了 ===\n{action}\n未完了: {outcome.total - outcome.completed}件{note}"
     output_line = (
         _project_output_line(project)
         if project is not None
@@ -365,6 +377,46 @@ def _translation_completion_dialog(
             "生成したmq_localizerリソースパックを必ず有効化してください。",
         )
     return "info", "翻訳完了", message
+
+
+def _partial_confirmation_text(state: PartialTranslationState) -> str:
+    quota = state.quota
+    return (
+        "次のリクエストが無料枠内に収まらないため、送信せず停止しました。\n\n"
+        f"モデル: {state.model}\n{GROUP_LABELS[quota.group]} / Usage Tier {quota.usage_tier}\n"
+        f"実使用量: {quota.used_tokens:,} / {quota.daily_limit:,} tokens\n"
+        f"予約・使用量不明: {quota.reserved_tokens:,} tokens\n"
+        f"残り: {quota.remaining_tokens:,} / 次回最大: {state.required_max_tokens:,} tokens\n\n"
+        f"安全に部分出力可能: {state.completed} / {state.total} 件\n"
+        f"未完了: {state.total - state.completed} 件\n\n"
+        "完成済みの翻訳だけを書き込みますか？"
+    )
+
+
+def _ask_partial_output(parent: tk.Tk, state: PartialTranslationState) -> bool:
+    window = tk.Toplevel(parent)
+    window.title("無料トークン枠の残量不足")
+    window.transient(parent)
+    window.geometry(f"+{parent.winfo_rootx()}+{parent.winfo_rooty()}")
+    approved = False
+
+    def finish(save: bool = False) -> None:
+        nonlocal approved
+        approved = save
+        window.destroy()
+
+    ttk.Label(window, text=_partial_confirmation_text(state), justify="left", wraplength=580).pack(padx=20, pady=20)
+    buttons = ttk.Frame(window)
+    buttons.pack(padx=20, pady=(0, 20), anchor="e")
+    ttk.Button(buttons, text="途中まで書き込む", command=lambda: finish(True)).pack(side="left", padx=8)
+    decline = ttk.Button(buttons, text="書き込まず終了", command=finish)
+    decline.pack(side="left")
+    decline.focus_set()
+    window.bind("<Escape>", lambda _event: finish())
+    window.protocol("WM_DELETE_WINDOW", finish)
+    window.grab_set()
+    parent.wait_window(window)
+    return approved
 
 
 def _output_confirmation(project: TranslationProject) -> tuple[str, str, bool]:
@@ -1565,6 +1617,12 @@ class MainWindow:
             self._open_settings("openai")
             return
         official_endpoint = is_official_api_base_url(api_base_url)
+        if self.settings.free_tokens_only and (
+            not official_endpoint or group_for_model(self.settings.model) is None
+        ):
+            messagebox.showwarning("無料枠保護", "OpenAI公式APIと無料トークン枠の対象モデルを選択してください。")
+            self._open_settings("openai")
+            return
         if official_endpoint and not self.session_api_key:
             messagebox.showwarning(
                 "OpenAI設定",
@@ -1606,7 +1664,9 @@ class MainWindow:
         batch_size = self.settings.batch_size
         batch_char_limit = self.settings.batch_char_limit
         translation_prompt = self.settings.translation_prompt
-        fast_mode = bool(self.settings.fast_mode and official_endpoint)
+        free_tokens_only = self.settings.free_tokens_only
+        usage_tier = self.settings.usage_tier
+        fast_mode = bool(self.settings.fast_mode and official_endpoint and not free_tokens_only)
         debug_logging = self.settings.debug_logging
 
         selected_labels = [
@@ -1619,8 +1679,9 @@ class MainWindow:
             f"API送信先: {api_base_url}\n"
             f"モデル: {model}\n"
             f"Fast Mode: {'ON' if fast_mode else 'OFF'}\n"
+            f"無料枠保護: {'ON' if free_tokens_only else 'OFF'} / Usage Tier {usage_tier}\n"
             f"timeout: {request_timeout}秒\n"
-            f"通信再試行: {max_retries}回（初回を除く）\n"
+            f"翻訳POSTの通信再試行: {0 if free_tokens_only else max_retries}回（初回を除く）\n"
             f"resourcepacks走査: {'ON' if request.get('scan_resourcepacks', False) else 'OFF'}\n"
             "固有名詞保護の走査上限: "
             f"{_glossary_scan_limits_summary(current_scan_limits)}\n"
@@ -1781,6 +1842,11 @@ class MainWindow:
                 translation_prompt=translation_prompt,
                 on_retry=self._queue_openai_retry,
                 on_debug=self._write_openai_debug if debug_logging else None,
+                quota_ledger=QuotaLedger(
+                    getattr(getattr(self, "store", None), "path", SettingsStore().path).parent / "openai-usage.json"
+                ),
+                free_tokens_only=free_tokens_only,
+                usage_tier=usage_tier,
             )
             service = TranslationService(client, fast_mode=fast_mode)
 
@@ -1807,10 +1873,19 @@ class MainWindow:
                 progress=self._queue_progress,
                 cancel=self.cancel_event,
                 pre_write_guard=guard_output_write,
+                confirm_partial=self._await_partial_confirmation,
             )
             return self._prepare_translation_success(outcome, analysis)
 
         self._start_worker(work, "translated")
+
+    def _await_partial_confirmation(self, state: PartialTranslationState) -> bool:
+        decision = _ApprovalDecision()
+        self.events.put(("confirm_partial", (decision, state)))
+        while not decision.ready.wait(0.1):
+            if self.cancel_event.is_set():
+                raise CancelledError("処理をキャンセルしました")
+        return decision.approved
 
     def _await_glossary_confirmation(
         self,
@@ -2105,6 +2180,17 @@ class MainWindow:
                     finally:
                         decision.approved = approved
                         decision.ready.set()
+                elif event == "confirm_partial":
+                    decision, state = payload
+                    try:
+                        decision.approved = (
+                            not self.close_pending and not self.cancel_event.is_set()
+                            and _ask_partial_output(self.root, state)
+                        )
+                    except tk.TclError:
+                        decision.approved = False
+                    finally:
+                        decision.ready.set()
                 elif event == "confirm_without_glossary":
                     decision, reason, has_protection = payload
                     approved = not self.close_pending and not self.cancel_event.is_set()
@@ -2182,12 +2268,12 @@ class MainWindow:
                             analysis.glossary.warnings,
                         )
                     )
-                    self.progress_var.set(100)
-                    self.status_var.set("翻訳が完了しました")
+                    self.progress_var.set(outcome.completed / outcome.total * 100 if outcome.partial and outcome.total else 100)
+                    self.status_var.set("無料枠不足で途中終了しました" if outcome.partial else "翻訳が完了しました")
                     self._render_durable_log_event(
                         completion_notice,
-                        "ok",
-                        section="翻訳完了",
+                        "warning" if outcome.partial else "ok",
+                        section="無料枠不足による途中終了" if outcome.partial else "翻訳完了",
                     )
                     if analysis.log_error:
                         self._report_session_log_error(analysis.log_error)
@@ -2198,6 +2284,10 @@ class MainWindow:
                         dialog_kind, dialog_title, dialog_message = (
                             _translation_completion_dialog(project, warning_count)
                         )
+                        if outcome.partial:
+                            dialog_kind = "warning"
+                            dialog_title = "無料枠不足による途中終了"
+                            dialog_message = _format_translation_completion(outcome, project).strip()
                         if dialog_kind == "warning":
                             messagebox.showwarning(dialog_title, dialog_message)
                         else:
@@ -2641,8 +2731,8 @@ class MainWindow:
         project = getattr(analyzed, "project", None)
         notice = self._persist_worker_log(
             _format_translation_completion(outcome, project),
-            level="SUCCESS",
-            section="翻訳完了",
+            level="WARNING" if outcome.partial else "SUCCESS",
+            section="無料枠不足による途中終了" if outcome.partial else "翻訳完了",
         )
         return _WorkerTranslationEvent(
             outcome=outcome,
@@ -2950,6 +3040,9 @@ class SettingsDialog:
         )
         self.model_var = tk.StringVar(value=settings.model)
         self.fast_mode_var = tk.BooleanVar(value=settings.fast_mode)
+        self.free_tokens_only_var = tk.BooleanVar(value=settings.free_tokens_only)
+        self.usage_tier_var = tk.IntVar(value=settings.usage_tier)
+        self.quota_status_var = tk.StringVar()
         self.debug_logging_var = tk.BooleanVar(value=settings.debug_logging)
         self.batch_var = tk.IntVar(value=settings.batch_size)
         self.char_limit_var = tk.IntVar(value=settings.batch_char_limit)
@@ -2980,6 +3073,9 @@ class SettingsDialog:
             self._api_base_url_changed,
         )
         self._update_api_endpoint_controls()
+        self.free_tokens_only_var.trace_add("write", lambda *_: self._update_api_endpoint_controls())
+        self.usage_tier_var.trace_add("write", lambda *_: self._refresh_quota_status())
+        self.model_var.trace_add("write", lambda *_: self._refresh_quota_status())
         self._select_tab(initial_tab)
         self.window.bind("<Escape>", lambda _event: self._close())
         self.window.protocol("WM_DELETE_WINDOW", self._close)
@@ -3125,6 +3221,10 @@ class SettingsDialog:
         )
         if not official:
             self.fast_mode_var.set(False)
+        free_var = getattr(self, "free_tokens_only_var", None)
+        free_only = bool(free_var is not None and free_var.get())
+        if free_only:
+            self.fast_mode_var.set(False)
         fetching = bool(getattr(self, "fetching", False))
         model_state = (
             "disabled"
@@ -3137,7 +3237,7 @@ class SettingsDialog:
         fast_mode_check = getattr(self, "fast_mode_check", None)
         if fast_mode_check is not None:
             fast_mode_check.configure(
-                state="normal" if official and not fetching else "disabled"
+                state="normal" if official and not fetching and not free_only else "disabled"
             )
         fast_mode_help = getattr(self, "fast_mode_help", None)
         if fast_mode_help is not None:
@@ -3158,6 +3258,29 @@ class SettingsDialog:
                     else "Windows DPAPIでこのユーザー用に暗号化保存"
                 )
             )
+        if hasattr(self, "quota_status_var"):
+            self.free_tokens_only_check.configure(state="disabled" if fetching else "normal")
+            self.usage_tier_combo.configure(state="disabled" if fetching else "readonly")
+            self._refresh_quota_status()
+
+    def _refresh_quota_status(self) -> None:
+        try:
+            tier = int(self.usage_tier_var.get())
+            limits_for_usage_tier(tier)
+            official = is_official_api_base_url(normalize_api_base_url(self.api_base_url_var.get()))
+            group = group_for_model(self.model_var.get()) if official else None
+            statuses = QuotaLedger(self.store.path.parent / "openai-usage.json").statuses(tier)
+            lines = [f"現在のモデル: {GROUP_LABELS[group]}" if group else "無料トークン枠の対象モデルではありません"]
+            for key, status in statuses.items():
+                lines.append(
+                    f"{GROUP_LABELS[key]}{' ← 使用中' if key == group else ''}\n"
+                    f"  実使用 {status.used_tokens:,} / {status.daily_limit:,}　"
+                    f"予約・不明 {status.reserved_tokens:,}　残り {status.remaining_tokens:,}"
+                )
+            lines.append("実使用量のリセット: 毎日09:00 JST（00:00 UTC）")
+            self.quota_status_var.set("\n".join(lines))
+        except (LocalizerError, ValueError, tk.TclError) as exc:
+            self.quota_status_var.set(str(exc))
 
     def _build_translation_tab(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(1, weight=1)
@@ -3570,6 +3693,28 @@ class SettingsDialog:
             sticky="w",
             pady=(2, 0),
         )
+
+        quota_box = ttk.LabelFrame(frame, text="無料トークン枠（このアプリのローカル集計）", padding=10)
+        quota_box.grid(row=7, column=0, columnspan=2, sticky="ew", pady=10)
+        self.free_tokens_only_check = ttk.Checkbutton(
+            quota_box, text="無料トークン枠を超えるリクエストを送信しない", variable=self.free_tokens_only_var
+        )
+        self.free_tokens_only_check.grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(quota_box, text="Usage Tier").grid(row=1, column=0, sticky="w", pady=6)
+        self.usage_tier_combo = ttk.Combobox(
+            quota_box, textvariable=self.usage_tier_var, values=(1, 2, 3, 4, 5), state="readonly", width=5
+        )
+        self.usage_tier_combo.grid(row=1, column=1, sticky="w")
+        ttk.Button(quota_box, text="使用量表示を更新", command=self._refresh_quota_status).grid(row=1, column=2, padx=10)
+        ttk.Label(quota_box, textvariable=self.quota_status_var, justify="left", wraplength=650).grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Label(
+            quota_box,
+            text=("公式API専用。無料枠対象のOrganization・プロジェクトでデータ共有が有効か、"
+                  "Tierが正しいかを事前に確認してください。共有設定は変更しません。\n"
+                  "別アプリ・別PC・導入前の消費は集計できず、課金ゼロは保証できません。"
+                  "Fast Modeとは併用できません。通信失敗時は最大使用量を予約したまま停止します。"),
+            foreground="#9a3412", justify="left", wraplength=650,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         prompt_box = ttk.LabelFrame(frame, text="カスタム翻訳プロンプト", padding=10)
         prompt_box.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=(10, 6))
@@ -4082,6 +4227,11 @@ class SettingsDialog:
             timeout = int(self.timeout_var.get())
             max_retries = int(self.retry_var.get())
             translation_prompt = self.prompt_text.get("1.0", "end-1c").strip()
+            usage_tier = int(value("usage_tier_var", self.settings.usage_tier))
+            limits_for_usage_tier(usage_tier)
+            free_tokens_only = bool(value("free_tokens_only_var", self.settings.free_tokens_only))
+            if free_tokens_only and not official_endpoint:
+                raise ValueError("無料枠保護はOpenAI公式APIでのみ使用できます")
             if not 1 <= batch_size <= 100:
                 raise ValueError("1バッチ件数は1〜100で指定してください")
             if not 500 <= char_limit <= 50000:
@@ -4131,8 +4281,10 @@ class SettingsDialog:
             self.settings.cached_models = cached_models[:MAX_CACHED_MODEL_COUNT]
             self.settings.cached_models_base_url = api_base_url
             self.settings.fast_mode = bool(
-                official_endpoint and self.fast_mode_var.get()
+                official_endpoint and self.fast_mode_var.get() and not free_tokens_only
             )
+            self.settings.free_tokens_only = free_tokens_only
+            self.settings.usage_tier = usage_tier
             self.settings.debug_logging = bool(
                 value("debug_logging_var", self.settings.debug_logging)
             )

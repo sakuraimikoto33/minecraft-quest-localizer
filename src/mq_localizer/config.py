@@ -45,6 +45,8 @@ class AppSettings:
     cached_models: list[str] = field(default_factory=list)
     cached_models_base_url: str = DEFAULT_API_BASE_URL
     fast_mode: bool = False
+    free_tokens_only: bool = False
+    usage_tier: int = 1
     debug_logging: bool = False
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT
     source_locale: str = "en_us"
@@ -229,6 +231,7 @@ def _validated_settings(raw: dict[str, Any]) -> AppSettings:
         result.target_locale = defaults.target_locale
 
     integer_ranges = {
+        "usage_tier": (1, 5),
         "batch_size": (1, 100),
         "batch_char_limit": (500, 50000),
         "request_timeout": (10, 600),
@@ -325,6 +328,7 @@ def _validated_settings(raw: dict[str, Any]) -> AppSettings:
         "preserve_existing",
         "save_api_key",
         "fast_mode",
+        "free_tokens_only",
         "debug_logging",
         "skip_glossary_confirmation",
         "scan_resourcepacks",
@@ -387,6 +391,8 @@ def _validated_settings(raw: dict[str, Any]) -> AppSettings:
         result.api_key_ciphertext = ""
         result.api_key_base_url = ""
     elif not is_official_api_base_url(result.api_base_url):
+        result.fast_mode = False
+    if result.free_tokens_only:
         result.fast_mode = False
     return result
 

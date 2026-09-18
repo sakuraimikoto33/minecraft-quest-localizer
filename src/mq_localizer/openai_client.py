@@ -20,6 +20,7 @@ from typing import Any, Callable, Protocol
 
 from .domain import CancelledError, TranslationError
 from .protection import protected_syntax_signature
+from .quota import QuotaLedger, group_for_model, limits_for_usage_tier
 from .unicode_safety import JAPANESE_UNICODE_INSTRUCTIONS, is_japanese_locale
 
 
@@ -1111,6 +1112,31 @@ def _require_exact_object_keys(
     )
 
 
+def _response_usage_tokens(body: dict[str, Any]) -> int | None:
+    usage = body.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    values = [usage.get(key) for key in ("input_tokens", "output_tokens", "total_tokens")]
+    if not all(type(value) is int and value >= 0 for value in values):
+        return None
+    inputs, outputs, total = values
+    return total if inputs + outputs == total else None
+
+
+def _translation_output_budget(model: str, payload: dict[str, Any]) -> int:
+    # UTF-8 size is deliberately generous for Japanese expansion, token
+    # positions/fragments JSON and reasoning. It is an output ceiling, not an
+    # estimate of actual usage; only response.usage is charged on success.
+    size = len(str(payload["input"]).encode("utf-8"))
+    schema_size = len(json.dumps(payload["text"], ensure_ascii=False).encode("utf-8"))
+    ceiling = 128_000 if model.startswith("gpt-5") else 32_768
+    if model.startswith("gpt-4o"):
+        ceiling = 4096 if model == "gpt-4o-2024-05-13" else 16_384
+    if model.startswith(("o1", "o3", "o4")):
+        ceiling = 32_768 if model.startswith("o1-preview") else 100_000
+    return min(ceiling, 4096 + 2 * size + schema_size)
+
+
 class OpenAIClient:
     def __init__(
         self,
@@ -1121,6 +1147,9 @@ class OpenAIClient:
         translation_prompt: str = DEFAULT_TRANSLATION_PROMPT,
         on_retry: Callable[[OpenAIRetryEvent], None] | None = None,
         on_debug: Callable[[str], None] | None = None,
+        quota_ledger: QuotaLedger | None = None,
+        free_tokens_only: bool = False,
+        usage_tier: int = 1,
     ) -> None:
         self.transport = transport or UrllibJsonTransport()
         self.base_url = normalize_api_base_url(base_url)
@@ -1129,6 +1158,10 @@ class OpenAIClient:
         self.max_retries = max(0, max_retries)
         self.on_retry = on_retry
         self.on_debug = on_debug
+        self.quota_ledger = quota_ledger
+        self.free_tokens_only = free_tokens_only
+        limits_for_usage_tier(usage_tier)
+        self.usage_tier = usage_tier
         stripped_prompt = translation_prompt.strip()
         self.translation_prompt = stripped_prompt or DEFAULT_TRANSLATION_PROMPT
 
@@ -1182,6 +1215,7 @@ class OpenAIClient:
         normalized_model = model.strip()
         if not is_safe_model_id(normalized_model):
             raise TranslationError("安全に使用できるモデルIDを指定してください")
+        self.validate_quota_configuration(normalized_model, service_tier)
         structured_items = _prepare_structured_translation_items(items)
         schema = _structured_translation_schema(structured_items)
         property_count = _schema_property_count(schema)
@@ -1227,7 +1261,44 @@ class OpenAIClient:
         }
         if service_tier is not None and self.is_official_endpoint:
             payload["service_tier"] = service_tier
+        reservation = None
+        group = group_for_model(normalized_model) if self.is_official_endpoint else None
+        if self.free_tokens_only:
+            # Count the very same model, instructions, input and JSON schema.
+            # Generation-only options are not accepted by input_tokens.
+            count_payload = {key: payload[key] for key in ("model", "instructions", "input", "text")}
+            counted = self._request_with_retries(
+                "POST", "/responses/input_tokens", api_key, count_payload, cancel
+            )
+            input_tokens = counted.get("input_tokens")
+            if type(input_tokens) is not int or input_tokens < 0:
+                raise TranslationError("入力トークン数を確認できないため翻訳リクエストを送信しません")
+            maximum = _translation_output_budget(normalized_model, payload)
+            payload["max_output_tokens"] = maximum
+            payload["service_tier"] = "default"
+            if cancel and cancel.is_set():
+                raise CancelledError("処理をキャンセルしました")
+            assert self.quota_ledger is not None and group is not None
+            reservation = self.quota_ledger.reserve(group, self.usage_tier, input_tokens + maximum)
+        # On timeout, cancellation, an HTTP error or malformed usage, keep the
+        # reservation. There is no proof that the provider consumed no tokens.
         body = self._request_with_retries("POST", "/responses", api_key, payload, cancel)
+        if self.quota_ledger is not None and group is not None:
+            usage = _response_usage_tokens(body)
+            returned_model = body.get("model")
+            if self.free_tokens_only and (
+                usage is None
+                or (returned_model is not None and group_for_model(str(returned_model)) != group)
+            ):
+                raise TranslationError(
+                    "OpenAIの使用量またはモデルグループを確認できません。"
+                    "最大使用量の予約を保持して停止しました。"
+                )
+            if usage is not None:
+                if reservation is not None:
+                    self.quota_ledger.settle(reservation, usage)
+                else:
+                    self.quota_ledger.record(group, usage)
         _require_completed_response(body, api_key)
         _raise_if_response_refused(body, api_key)
         try:
@@ -1245,6 +1316,19 @@ class OpenAIClient:
                 "OpenAI の翻訳応答を JSON として解析できませんでした"
             ) from exc
         return _restore_structured_translations(parsed, structured_items)
+
+    def validate_quota_configuration(self, model: str, service_tier: str | None = None) -> None:
+        if not self.free_tokens_only:
+            return
+        if not self.is_official_endpoint:
+            raise TranslationError("無料枠保護はOpenAI公式APIでのみ使用できます")
+        if group_for_model(model) is None:
+            raise TranslationError("無料トークン枠の対象モデルではありません")
+        if service_tier is not None:
+            raise TranslationError("無料枠保護とFast Modeは併用できません")
+        if self.quota_ledger is None:
+            raise TranslationError("無料枠の使用量ファイルが設定されていません")
+        self.quota_ledger.statuses(self.usage_tier)
 
     def _request_with_retries(
         self,
@@ -1268,7 +1352,8 @@ class OpenAIClient:
         }
         if normalized_api_key:
             headers["Authorization"] = f"Bearer {normalized_api_key}"
-        for attempt in range(self.max_retries + 1):
+        max_retries = 0 if self.free_tokens_only and endpoint == "/responses" else self.max_retries
+        for attempt in range(max_retries + 1):
             if cancel and cancel.is_set():
                 cancelled = CancelledError("処理をキャンセルしました")
                 self._emit_debug(
@@ -1323,7 +1408,7 @@ class OpenAIClient:
                     api_key,
                     error=exc,
                 )
-                if not exc.retryable or attempt >= self.max_retries:
+                if not exc.retryable or attempt >= max_retries:
                     safe_request_id = _redact_sensitive(exc.request_id or "", api_key)
                     safe_message = _redact_sensitive(str(exc), api_key)
                     suffix = (
@@ -1360,7 +1445,7 @@ class OpenAIClient:
                 delay = min(8.0, 1.0 * (2**attempt))
                 retry_event = OpenAIRetryEvent(
                     attempt=attempt + 1,
-                    max_retries=self.max_retries,
+                    max_retries=max_retries,
                     delay=delay,
                     endpoint=endpoint,
                     status=exc.status,
