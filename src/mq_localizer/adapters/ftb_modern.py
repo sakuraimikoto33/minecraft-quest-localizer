@@ -131,6 +131,9 @@ class FtbModernSnbtAdapter(QuestAdapter):
             documents=[document],
             metadata={"newline": newline, "source_snapshot": source_snapshot},
             warnings=warnings,
+            atomic_output_groups=tuple(
+                tuple(value) for value in ids.values() if isinstance(value, list) and value
+            ),
         )
         if default_output.exists() and default_output.resolve() != source_file.resolve():
             project.existing, project.metadata["existing_unknown"] = _partition_existing(

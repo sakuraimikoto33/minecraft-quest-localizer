@@ -53,6 +53,9 @@ class TranslationProject:
     metadata: dict[str, Any] = field(default_factory=dict, repr=False)
     existing: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # Adapter-defined values (e.g. a locale array) that cannot be written in
+    # fragments. A quota stop may emit a group only when every member is ready.
+    atomic_output_groups: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

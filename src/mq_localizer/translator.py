@@ -486,8 +486,6 @@ class TranslationService:
                         target_locale,
                         cancel,
                     )
-                except ComplimentaryQuotaExhausted:
-                    raise
                 except TranslationError as retry_error:
                     retry_part = _part_for_item_id(
                         root,
@@ -688,13 +686,17 @@ class TranslationService:
                 ) from exc
             quota_error = exc
             selected_set = {unit.id for unit in selected_units}
-            # A visible component/title group is atomic for partial output.
-            # Iterate to closure because the two group types can overlap.
+            # Locale arrays and visible component/title groups are atomic for
+            # partial output. Iterate to closure because groups can overlap.
+            required_groups = [
+                selected_set.intersection(group)
+                for group in (*terminology_groups, *reference_term_groups)
+            ]
+            required_groups.extend(set(group) for group in project.atomic_output_groups)
             changed = True
             while changed:
                 changed = False
-                for group in (*terminology_groups, *reference_term_groups):
-                    required = selected_set.intersection(group)
+                for required in required_groups:
                     if not required.issubset(resolved):
                         for unit_id in required.intersection(resolved):
                             del resolved[unit_id]

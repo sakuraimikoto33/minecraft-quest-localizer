@@ -18,6 +18,10 @@ from mq_localizer.openai_client import OpenAIAPIError, OpenAIClient, OpenAIRespo
 from mq_localizer.quota import ComplimentaryQuotaExhausted, QuotaLedger, QuotaStatus, group_for_model, limits_for_usage_tier
 from mq_localizer.translator import TranslationOptions, TranslationService
 from mq_localizer.ui import _format_translation_completion, _partial_confirmation_text
+from mq_localizer.adapters.ftb_modern import FtbModernSnbtAdapter
+from mq_localizer.adapters.ftb_split_snbt import FtbSplitSnbtAdapter
+from mq_localizer.adapters.ftb_split_json5 import FtbSplitJson5Adapter
+from mq_localizer.snbt import parse_lang_snbt
 
 
 class LedgerTests(unittest.TestCase):
@@ -312,6 +316,73 @@ class PartialTranslationTests(unittest.TestCase):
         outcome = self.run_job(BudgetClient(successful=0), lambda _: True, project)
         self.assertEqual((outcome.reused, outcome.copied_without_translation), (1, 1))
         self.assertEqual(set(self.adapter.writes[0][0]), {"0", "2"})
+
+    def test_array_and_visible_groups_are_filtered_to_a_fixed_point(self):
+        project = self.project(("One", "Two", "Three", "Four"))
+        project.atomic_output_groups = (("1", "2"),)
+        project.metadata["terminology_groups"] = [("0", "1")]
+        outcome = self.run_job(BudgetClient(successful=2), lambda _: self.fail("Nothing safe to save"), project)
+        self.assertEqual(outcome.completed, 0)
+        self.assertEqual(self.adapter.writes, [])
+
+    def test_quota_during_safety_retry_must_not_offer_partial_save(self):
+        class UnsafeThenExhausted:
+            calls = 0
+            def translate_batch(self, key, model, items, source, target, cancel=None):
+                self.calls += 1
+                if self.calls > 1:
+                    raise exhausted()
+                return {item["id"]: ("安全な訳" if item["id"] == "0" else "") for item in items}
+        with self.assertRaises(TranslationError):
+            self.run_job(UnsafeThenExhausted(), lambda _: self.fail("Unsafe reply is not a quota stop"))
+        self.assertEqual(self.adapter.writes, [])
+
+
+class PartialArrayAdapterTests(unittest.TestCase):
+    def test_real_locale_adapters_write_only_complete_arrays(self):
+        for adapter, suffix, split in (
+            (FtbModernSnbtAdapter(), ".snbt", False),
+            (FtbSplitSnbtAdapter(), ".snbt", True),
+            (FtbSplitJson5Adapter(), ".json5", True),
+        ):
+            for accept in (True, False):
+                with self.subTest(adapter=adapter.id, accept=accept), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / "config" / "ftbquests" / "quests" / "lang"
+                    source = root / "en_us" / ("chapter" + suffix) if split else root / ("en_us" + suffix)
+                    source.parent.mkdir(parents=True)
+                    # The second description reaches quota after just one of
+                    # its nonempty lines. Empty lines were already resolved.
+                    values = {
+                        "quest.A.quest_desc": ["First", ""],
+                        "quest.B.quest_desc": ["Second", "", "Third"],
+                    }
+                    source.write_text(json.dumps(values), encoding="utf-8")
+                    project = adapter.load(source.parent if split else source, "en_us", "ja_jp", "1.21.1")
+                    self.assertEqual(tuple(map(len, project.atomic_output_groups)), (2, 3))
+                    output = project.default_output / ("chapter" + suffix) if split else project.default_output
+                    before = source.read_bytes()
+                    states = []
+                    guards = []
+                    def confirm(state):
+                        states.append(state)
+                        self.assertFalse(output.exists())
+                        return accept
+                    outcome = TranslationService(BudgetClient(successful=2)).translate(
+                        project, adapter, project.default_output, "test", "gpt-5.6-sol",
+                        GlossaryCatalog(), TranslationOptions(), confirm_partial=confirm,
+                        pre_write_guard=lambda: guards.append(True),
+                    )
+                    self.assertTrue(outcome.partial)
+                    self.assertEqual(outcome.completed, 2)
+                    self.assertEqual(outcome.copied_without_translation, 1)
+                    self.assertEqual(states[0].completed, 2)
+                    self.assertEqual(guards, [True] if accept else [])
+                    self.assertEqual(output.exists(), accept)
+                    if accept:
+                        raw = output.read_text(encoding="utf-8")
+                        parsed = json.loads(raw) if suffix == ".json5" else parse_lang_snbt(raw)
+                        self.assertEqual(parsed, {"quest.A.quest_desc": ["翻訳", ""]})
+                    self.assertEqual(source.read_bytes(), before)
 
 
 if __name__ == "__main__":

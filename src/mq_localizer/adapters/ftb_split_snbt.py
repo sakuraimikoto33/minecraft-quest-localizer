@@ -160,6 +160,10 @@ class FtbSplitSnbtAdapter(QuestAdapter):
             documents=documents,
             metadata={"source_dir": source_dir, "source_snapshot": source_snapshot},
             warnings=warnings,
+            atomic_output_groups=tuple(
+                tuple(value) for document in documents
+                for value in document.unit_ids.values() if isinstance(value, list) and value
+            ),
         )
         validate_split_locale_targets(
             source_dir,
