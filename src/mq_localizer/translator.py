@@ -33,7 +33,12 @@ from .protection import (
     without_leading_styled_article,
 )
 from .unicode_safety import translation_unicode_issue
-from .translation_quality import japanese_word_order_issue
+from .translation_quality import (
+    IMAGE_TITLE_RETRY_INSTRUCTIONS,
+    JAPANESE_WORD_ORDER_RETRY_INSTRUCTIONS,
+    image_title_translation_issue,
+    japanese_word_order_issue,
+)
 from .quota import ComplimentaryQuotaExhausted, QuotaStatus
 
 
@@ -593,6 +598,12 @@ class TranslationService:
                     f"{_part_location_details(failed_part)}\n{_PROTECTION_RETRY_CONTEXT}\n"
                     f"Previous validation failure: {first_reason}"
                 )
+                if "日本語の語順" in first_reason:
+                    retry_context = (
+                        f"{retry_context}\n{JAPANESE_WORD_ORDER_RETRY_INSTRUCTIONS}"
+                    )
+                if "画像タイトルに説明文" in first_reason:
+                    retry_context = f"{retry_context}\n{IMAGE_TITLE_RETRY_INSTRUCTIONS}"
                 retry_items = [
                     _provider_item(
                         part,
@@ -734,6 +745,7 @@ class TranslationService:
                     unit_glossary,
                     project.source_locale,
                     project.target_locale,
+                    unit_key=unit.key,
                     treat_as_plain=unit.id in terminology_spans,
                 ) and existing_group_safety.get(unit.id, True):
                     resolved[unit.id] = existing
@@ -1763,6 +1775,10 @@ def _restore_bundle_response(
         quality_issue = japanese_word_order_issue(
             root.protected.original, restored_parts[root.id], source_locale, target_locale,
         )
+        if quality_issue is None:
+            quality_issue = image_title_translation_issue(
+                root.unit_key, root.protected.original, restored_parts[root.id], target_locale,
+            )
         if quality_issue:
             return {}, (root, TranslationError(quality_issue))
     return restored_parts, None
@@ -2587,12 +2603,15 @@ def _existing_translation_is_safe(
     source_locale: str = "en_us",
     target_locale: str = "ja_jp",
     *,
+    unit_key: str = "",
     treat_as_plain: bool = False,
 ) -> bool:
     if treat_as_plain or not looks_like_raw_json_text(source):
         if not should_translate(source):
             return candidate == source
         if japanese_word_order_issue(source, candidate, source_locale, target_locale):
+            return False
+        if image_title_translation_issue(unit_key, source, candidate, target_locale):
             return False
         return (
             _existing_text_syntax_is_compatible(

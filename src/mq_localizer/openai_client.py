@@ -22,7 +22,11 @@ from .domain import CancelledError, TranslationError
 from .protection import protected_syntax_signature
 from .quota import QuotaLedger, group_for_model, limits_for_usage_tier
 from .unicode_safety import JAPANESE_UNICODE_INSTRUCTIONS, is_japanese_locale
-from .translation_quality import JAPANESE_WORD_ORDER_INSTRUCTIONS
+from .translation_quality import (
+    IMAGE_TITLE_RETRY_INSTRUCTIONS,
+    JAPANESE_WORD_ORDER_INSTRUCTIONS,
+    JAPANESE_WORD_ORDER_RETRY_INSTRUCTIONS,
+)
 
 
 DEFAULT_TRANSLATION_PROMPT = (
@@ -1269,6 +1273,20 @@ class OpenAIClient:
         if is_japanese_locale(target_locale):
             instructions = f"{instructions}\n\n{JAPANESE_UNICODE_INSTRUCTIONS}"
             instructions = f"{instructions}\n\n{JAPANESE_WORD_ORDER_INSTRUCTIONS}"
+        if any(
+            isinstance(item, dict)
+            and "JAPANESE WORD-ORDER RETRY" in str(item.get("context", ""))
+            for item in items
+        ):
+            # Retry guidance is repeated at the instruction level so the model
+            # cannot miss it inside the per-item context payload.
+            instructions = f"{instructions}\n\n{JAPANESE_WORD_ORDER_RETRY_INSTRUCTIONS}"
+        if any(
+            isinstance(item, dict)
+            and "IMAGE TITLE RETRY" in str(item.get("context", ""))
+            for item in items
+        ):
+            instructions = f"{instructions}\n\n{IMAGE_TITLE_RETRY_INSTRUCTIONS}"
         payload = {
             "model": normalized_model,
             "instructions": instructions,
