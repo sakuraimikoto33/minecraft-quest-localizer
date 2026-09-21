@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mq_localizer.config import AppSettings, SettingsStore  # noqa: E402
+from mq_localizer.config import ApiKeyProfile, AppSettings, SettingsStore  # noqa: E402
 from mq_localizer.categories import DEFAULT_TRANSLATION_CATEGORY_IDS  # noqa: E402
 from mq_localizer.openai_client import (  # noqa: E402
     DEFAULT_API_BASE_URL,
@@ -219,6 +219,65 @@ class SettingsStoreTests(unittest.TestCase):
             self.assertEqual(store.read_api_key(settings), "custom-secret")
             settings.api_base_url = DEFAULT_API_BASE_URL
             self.assertEqual(store.read_api_key(settings), "")
+
+    def test_multiple_saved_api_keys_are_selected_by_endpoint(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        settings = AppSettings(
+            api_base_url="https://one.example/v1",
+            api_key_profiles=[
+                ApiKeyProfile(
+                    "https://one.example/v1",
+                    base64.b64encode(b"one-ciphertext").decode("ascii"),
+                ),
+                ApiKeyProfile(
+                    "https://two.example/v1",
+                    base64.b64encode(b"two-ciphertext").decode("ascii"),
+                ),
+            ],
+        )
+
+        def unprotect(value: bytes) -> bytes:
+            return value.decode("utf-8").replace("-ciphertext", "-key").encode("utf-8")
+
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("mq_localizer.config._dpapi_unprotect", side_effect=unprotect),
+        ):
+            self.assertEqual(store.read_api_key(settings), "one-key")
+            settings.api_base_url = "https://two.example/v1"
+            self.assertEqual(store.read_api_key(settings), "two-key")
+            self.assertTrue(store.has_saved_api_key(settings))
+            settings.api_base_url = "https://three.example/v1"
+            self.assertEqual(store.read_api_key(settings), "")
+            self.assertFalse(store.has_saved_api_key(settings))
+
+    def test_set_api_key_preserves_other_endpoint_profiles(self) -> None:
+        temporary, store = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        settings = AppSettings(api_base_url="https://one.example/v1")
+        with mock.patch(
+            "mq_localizer.config._dpapi_protect",
+            side_effect=lambda value: b"encrypted:" + value,
+        ):
+            store.set_api_key(settings, "one-key", True)
+            settings.api_base_url = "https://two.example/v1"
+            store.set_api_key(settings, "two-key", True)
+
+        self.assertEqual(
+            {profile.api_base_url for profile in settings.api_key_profiles},
+            {"https://one.example/v1", "https://two.example/v1"},
+        )
+        store.save(settings)
+        parsed = json.loads(
+            store.path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            {profile["api_base_url"] for profile in parsed["api_key_profiles"]},
+            {"https://one.example/v1", "https://two.example/v1"},
+        )
+        self.assertNotIn("api_key_ciphertext", parsed)
+        self.assertNotIn("api_key_base_url", parsed)
 
     def test_disabled_saved_key_is_not_decrypted(self) -> None:
         temporary, store = self.make_store()

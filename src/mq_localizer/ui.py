@@ -548,9 +548,16 @@ def _save_api_key_initially_selected(
     api_key_from_environment: bool,
 ) -> bool:
     """Never opt an environment-provided secret into DPAPI implicitly."""
-
+    try:
+        endpoint = normalize_api_base_url(settings.api_base_url)
+    except ValueError:
+        endpoint = ""
+    profile_saved = bool(endpoint) and any(
+        profile.api_base_url == endpoint and bool(profile.api_key_ciphertext)
+        for profile in settings.api_key_profiles
+    )
     return bool(
-        settings.save_api_key
+        (settings.save_api_key or profile_saved)
         and secure_persistence_available
         and not api_key_from_environment
     )
@@ -3046,6 +3053,7 @@ class SettingsDialog:
         )
         self.api_base_url_var = tk.StringVar(value=initial_api_base_url)
         self._api_base_url_identity = self._endpoint_identity(initial_api_base_url)
+        self._last_endpoint_identity = self._api_base_url_identity
         self._initial_api_key = api_key.strip()
         self.api_key_from_environment = _api_key_is_environment_value(
             api_key,
@@ -3085,6 +3093,13 @@ class SettingsDialog:
                 )
             )
         )
+        self._pending_endpoint_credentials: dict[str, tuple[str, bool, bool]] = {}
+        if self._api_base_url_identity[0] == "valid":
+            self._pending_endpoint_credentials[self._api_base_url_identity[1]] = (
+                api_key.strip(),
+                bool(self.save_key_var.get()),
+                self.api_key_from_environment,
+            )
         self.fetching = False
         self.model_cancel_event = threading.Event()
         self.model_events: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -3196,18 +3211,59 @@ class SettingsDialog:
         except ValueError:
             return False
 
+    def _credentials_for_endpoint(self, endpoint: str) -> tuple[str, bool, bool]:
+        """Load the key/save state associated with one normalized endpoint."""
+        pending = getattr(self, "_pending_endpoint_credentials", {})
+        if endpoint in pending:
+            return pending[endpoint]
+        store = getattr(self, "store", None)
+        settings = getattr(self, "settings", None)
+        if store is None or settings is None:
+            return "", False, False
+        endpoint_settings = replace(settings, api_base_url=endpoint)
+        api_key = store.read_api_key(endpoint_settings)
+        from_environment = _api_key_is_environment_value(api_key, endpoint)
+        return (
+            api_key,
+            bool(store.has_saved_api_key(endpoint_settings) and not from_environment),
+            from_environment,
+        )
+
     def _api_base_url_changed(self, *_args: object) -> None:
         value = self.api_base_url_var.get()
         identity = self._endpoint_identity(value)
         if identity == getattr(self, "_api_base_url_identity", None):
             self._update_api_endpoint_controls()
             return
+        old_identity = getattr(
+            self,
+            "_last_endpoint_identity",
+            getattr(self, "_api_base_url_identity", ("invalid", "")),
+        )
         self._api_base_url_identity = identity
         self.model_cancel_event.set()
-        self.api_key_var.set("")
-        self.save_key_var.set(False)
-        self.api_key_from_environment = False
-        self._initial_api_key = ""
+        pending = getattr(self, "_pending_endpoint_credentials", None)
+        if pending is not None and old_identity[0] == "valid":
+            pending[old_identity[1]] = (
+                self.api_key_var.get().strip(),
+                bool(self.save_key_var.get()),
+                bool(getattr(self, "api_key_from_environment", False)),
+            )
+        self._last_endpoint_identity = identity
+        if identity[0] == "valid" and hasattr(self, "store"):
+            api_key, persist, from_environment = self._credentials_for_endpoint(identity[1])
+            self.api_key_var.set(api_key)
+            self.save_key_var.set(persist)
+            self.api_key_from_environment = from_environment
+            self._initial_api_key = api_key
+        else:
+            # Keep the lightweight fallback used by headless tests and by an
+            # invalid endpoint: no credential is ever carried to an unknown
+            # destination.
+            self.api_key_var.set("")
+            self.save_key_var.set(False)
+            self.api_key_from_environment = False
+            self._initial_api_key = ""
         self.models = []
         self.model_var.set("")
         self.fast_mode_var.set(False)
@@ -4315,6 +4371,7 @@ class SettingsDialog:
             self.settings.request_timeout = timeout
             self.settings.max_retries = max_retries
             self._apply_api_key_persistence(api_key)
+            self._persist_pending_endpoint_keys(api_base_url)
             self.store.save(self.settings)
         except (OSError, ValueError, tk.TclError) as exc:
             if not isinstance(exc, OSError):
@@ -4346,6 +4403,21 @@ class SettingsDialog:
             # session-key semantics.
             return
         self.store.set_api_key(self.settings, api_key, persist)
+
+    def _persist_pending_endpoint_keys(self, active_endpoint: str) -> None:
+        """Persist edited endpoint/key pairs visited during this dialog.
+
+        Environment-derived OpenAI keys are intentionally skipped unless the
+        user explicitly checks the save option.  The active endpoint is
+        already handled by ``_apply_api_key_persistence``.
+        """
+        pending = getattr(self, "_pending_endpoint_credentials", {})
+        for endpoint, (api_key, persist, from_environment) in pending.items():
+            if endpoint == active_endpoint or (from_environment and not persist):
+                continue
+            endpoint_settings = replace(self.settings, api_base_url=endpoint)
+            self.store.set_api_key(endpoint_settings, api_key, persist)
+            self.settings.api_key_profiles = endpoint_settings.api_key_profiles
 
     def _close(self) -> None:
         self.model_cancel_event.set()
