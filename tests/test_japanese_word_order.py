@@ -49,6 +49,11 @@ _REPORTED_WORD_ORDER_CASES = (
         "の機械は、可能であれば&6Create&r上のアイテムと自動的にやり取りします。&aベルト&r",
         "&6Create&rの機械は、可能であれば&aベルト&r上のアイテムと自動的にやり取りします。",
     ),
+    (
+        "Using &bDragonskin&r dropped from the &dEnder Dragon&r, you can create this legendary spell book.",
+        "&bドラゴンスキン&rを使って、&dエンダードラゴン&rからドロップした伝説の呪文書を作成できます。",
+        "&dエンダードラゴン&rからドロップした&bドラゴンスキン&rを使うと、伝説の呪文書を作成できます。",
+    ),
 )
 
 

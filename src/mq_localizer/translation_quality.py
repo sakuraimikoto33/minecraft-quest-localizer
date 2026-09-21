@@ -30,7 +30,11 @@ JAPANESE_WORD_ORDER_INSTRUCTIONS = (
     "[Modern Industrialization]' becomes '[Modern Industrialization]は威圧的に見えます', "
     "and 'Once you've obtained [Sulfuric Crude Oil]' becomes "
     "'[硫酸性原油]を入手したら'. Do not leave an opening 'を', 'に', 'は', "
-    "'の', or similar particle before the term and append that term at the end."
+    "'の', or similar particle before the term and append that term at the end. "
+    "When the source says 'Using [item] dropped from the [source]', preserve the "
+    "modifier relationship and begin with '[source]からドロップした[item]を使うと' "
+    "or '[source]から入手した[item]を使うと'; do not begin '[item]を使って' "
+    "while moving the source later in the sentence."
 )
 JAPANESE_WORD_ORDER_RETRY_INSTRUCTIONS = (
     "JAPANESE WORD-ORDER RETRY: The previous output put a Japanese leading particle "
@@ -43,7 +47,9 @@ JAPANESE_WORD_ORDER_RETRY_INSTRUCTIONS = (
     "introductory clause, use the same order: '[Modern Industrialization]は威圧的に見えます', "
     "'[安山岩の外装]は装飾用として機能します', '[硫酸性原油]を入手したら', or "
     "'[FTBピラミッド]を完了するには'. Never put that connective in fragment_0000 "
-    "and append the styled token at the end."
+    "and append the styled token at the end. For 'Using [item] dropped from the "
+    "[source]', put the source first: '[source]からドロップした[item]を使うと'. "
+    "Do not return '[item]を使って' with the source introduced afterward."
 )
 IMAGE_TITLE_RETRY_INSTRUCTIONS = (
     "IMAGE TITLE RETRY: This item is a short image label, not a sentence. Return only "
@@ -94,6 +100,25 @@ def _formatting_group_spans(text: str) -> tuple[tuple[int, int], ...]:
             if first is not None and last is not None:
                 spans.append((first[0], last[1]))
     return tuple(sorted(spans))
+
+
+def _formatting_group_details(text: str) -> tuple[tuple[int, int, str], ...]:
+    """Return formatting spans together with each group's opening code."""
+
+    protected = TokenProtector().protect(text)
+    source_spans = dict(
+        zip(protected.special_placeholders, protected.special_source_spans, strict=True)
+    )
+    details: list[tuple[int, int, str]] = []
+    for segment in protected.formatting_segments:
+        for group in segment.movable_groups:
+            first = source_spans.get(group.placeholders[0])
+            last = source_spans.get(group.placeholders[-1])
+            if first is None or last is None:
+                continue
+            opening = protected.replacements.get(group.placeholders[0], "")
+            details.append((first[0], last[1], opening.lower()))
+    return tuple(sorted(details))
 
 
 def _strip_formatting(text: str) -> str:
@@ -243,6 +268,33 @@ def _detached_unstyled_name_issue(source: str, candidate: str) -> bool:
     return False
 
 
+def _dropped_from_using_issue(source: str, candidate: str) -> bool:
+    """Detect an item-first rendering of ``Using item dropped from source``.
+
+    English places the item before its postmodifier, while natural Japanese
+    normally starts with the source of the drop and then qualifies the item.
+    The opening style codes identify the two protected groups even when both
+    names have been translated, so this check does not depend on glossary text.
+    """
+
+    visible_source = _strip_formatting(source).strip()
+    if not re.match(
+        r"^Using\b.+\bdropped\s+from\b.+,\s*you\s+can\b",
+        visible_source,
+        re.IGNORECASE,
+    ):
+        return False
+    source_groups = _formatting_group_details(source)
+    candidate_groups = _formatting_group_details(candidate)
+    if len(source_groups) < 2 or len(candidate_groups) < 2:
+        return False
+    source_openings = tuple(item[2] for item in source_groups[:2])
+    candidate_openings = tuple(item[2] for item in candidate_groups[:2])
+    # If both groups use the same opening code, style order cannot identify
+    # which translated name is the item and which is the drop source.
+    return source_openings[0] != source_openings[1] and candidate_openings == source_openings
+
+
 def image_title_translation_issue(
     key: str, source: str, candidate: str, target_locale: str,
 ) -> str | None:
@@ -291,6 +343,12 @@ def japanese_word_order_issue(
         return None
     source_groups = _formatting_group_spans(source)
     candidate_groups = _formatting_group_spans(candidate)
+    if _dropped_from_using_issue(source, candidate):
+        return (
+            "日本語の語順が不自然です。ドロップ元を先に述べる文では、"
+            "「アイテムを使って」から始めず、「ドロップ元からドロップした"
+            "アイテムを使うと」の順にして、入手元とアイテムの関係を保持してください"
+        )
     if _detached_unstyled_name_issue(source, candidate):
         return (
             "日本語の語順が崩れています。装飾のない固有名詞が助詞の後ろまたは"
