@@ -1921,7 +1921,7 @@ def _project_reference_term_is_safe(value: str) -> bool:
         and any(character.isalnum() for character in value)
         and not any(character in "\r\n\t" or ord(character) < 0x20 for character in value)
         and all(
-            kind == "special" and token == r"\&"
+            kind == "special" and token in {r"\&", "\\&\\"}
             for kind, token in protected_syntax_signature(value)
         )
     )

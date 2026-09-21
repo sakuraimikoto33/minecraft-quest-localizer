@@ -269,13 +269,11 @@ class FormattingGroupReorderClient(PrefixClient):
                     "pipe": "パイプ",
                 }
                 result[item["id"]] = translations.get(item["text"], item["text"])
+                if item.get("term_bindings"):
+                    result[item["id"]] = (
+                        item["term_bindings"][0]["token"] + "のContainer"
+                    )
                 continue
-            term = item["term_bindings"][0]["token"]
-            physical = [
-                token
-                for token in _PROTECTED_TOKEN.findall(item["text"])
-                if token not in styled.values() and token != term
-            ]
             result[item["id"]] = (
                 "そのためには、"
                 + styled["Container"]
@@ -284,10 +282,7 @@ class FormattingGroupReorderClient(PrefixClient):
                 + "を設置する必要があります。"
                 + styled["pipe"]
                 + "を使って、それを"
-                + physical[0]
-                + term
-                + "のContainer"
-                + physical[1]
+                + styled["Extractor's Container"]
                 + "に接続するのを忘れないでください。"
             )
         return result
@@ -1386,15 +1381,18 @@ class TranslationServiceTests(unittest.TestCase):
         provider_text = root_item["text"]
         self.assertEqual(
             len(_PROTECTED_TOKEN.findall(provider_text)),
-            6,
-            "plain styled groupはatom、term+plain groupは既存3 tokenを保つ",
+            4,
+            "固有名詞と本文が混在する装飾範囲も親では不可分tokenにする",
         )
         self.assertEqual(
             {binding["source_text"] for binding in root_item["styled_bindings"]},
-            {"Infuser", "Container", "pipe"},
+            {"Infuser", "Container", "pipe", "Extractor's Container"},
         )
         self.assertNotIn("Infuser", provider_text)
-        self.assertIn("'s Container", provider_text)
+        self.assertNotIn("'s Container", provider_text)
+        mixed_child = next(item for item in client.calls[0] if item.get("term_bindings"))
+        self.assertIn("'s Container", mixed_child["text"])
+        self.assertEqual(mixed_child["term_bindings"][0]["source_term"], "Extractor")
         self.assertEqual(len(adapter.calls), 1)
         self.assertEqual(
             adapter.calls[0][1]["unit-1"],
@@ -1465,6 +1463,398 @@ class TranslationServiceTests(unittest.TestCase):
             "&eAir&rを消費します！",
         )
         self.assertEqual((outcome.translated, outcome.reused), (1, 0))
+
+    def test_reported_ftb_evolution_white_transition_terms_translate_without_retry(
+        self,
+    ) -> None:
+        class FtbEvolutionGemClient(PrefixClient):
+            def translate_batch(
+                self,
+                api_key: str,
+                model: str,
+                items: list[dict[str, Any]],
+                source_locale: str,
+                target_locale: str,
+                cancel: object = None,
+            ) -> dict[str, str]:
+                del api_key, model, source_locale, target_locale, cancel
+                self.calls.append(items)  # type: ignore[arg-type]
+                result: dict[str, str] = {}
+                for item in items:
+                    terms = {
+                        binding["source_term"]: binding["token"]
+                        for binding in item.get("term_bindings", [])
+                    }
+                    result[item["id"]] = (
+                        terms["Gem Case"]
+                        + "は、"
+                        + terms["Gems"]
+                        + "の保管とアップグレードに使用されます。 "
+                    )
+                return result
+
+        source = (
+            "The &dGem Case&f is used to store and upgrade &bGems&r. "
+        )
+        glossary = GlossaryCatalog(
+            entries={
+                source_term: GlossaryEntry(
+                    source=source_term,
+                    target=source_term,
+                    key=key,
+                    mod_id="apotheosis",
+                    translated=False,
+                    provenance=(
+                        "Apotheosis-1.21.1-8.8.0.jar!/assets/apotheosis/"
+                        "lang/en_us.json"
+                    ),
+                )
+                for source_term, key in (
+                    ("Gem Case", "block.apotheosis.gem_case"),
+                    ("Gems", "painting.apotheosis.gems.title"),
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = _categorized_project(
+                root,
+                [
+                    (
+                        "quest.01D2CEAF59872C33.quest_desc[0]",
+                        "quest.01D2CEAF59872C33.quest_desc[0]",
+                        source,
+                        "quest_description",
+                    )
+                ],
+            )
+            client = FtbEvolutionGemClient()
+            adapter = RecordingAdapter()
+            progress: list[str] = []
+
+            outcome = TranslationService(client).translate(
+                project,
+                adapter,
+                project.default_output,
+                "sk-test",
+                "gpt-test",
+                glossary,
+                TranslationOptions(),
+                progress=lambda _done, _total, message: progress.append(message),
+            )
+
+        self.assertEqual(len(client.calls), 1, "自然な語順変更で個別再試行しない")
+        self.assertEqual(len(client.calls[0]), 1)
+        item = client.calls[0][0]
+        self.assertEqual(
+            [binding["source_term"] for binding in item["term_bindings"]],
+            ["Gem Case", "Gems"],
+        )
+        self.assertEqual(len(_PROTECTED_TOKEN.findall(item["text"])), 2)
+        self.assertNotIn("Gem Case", item["text"])
+        self.assertNotIn("Gems", item["text"])
+        self.assertEqual(
+            adapter.calls[0][1]["quest.01D2CEAF59872C33.quest_desc[0]"],
+            (
+                "&dGem Case&fは、&bGems&rの保管とアップグレード"
+                "に使用されます。 "
+            ),
+        )
+        self.assertFalse(any("再試行" in message for message in progress))
+        self.assertEqual((outcome.translated, outcome.reused), (1, 0))
+
+    def test_reported_mekanism_compound_names_translate_and_reuse_without_retry(
+        self,
+    ) -> None:
+        class MekanismCompoundClient(PrefixClient):
+            def translate_batch(
+                self,
+                api_key: str,
+                model: str,
+                items: list[dict[str, Any]],
+                source_locale: str,
+                target_locale: str,
+                cancel: object = None,
+            ) -> dict[str, str]:
+                del api_key, model, source_locale, target_locale, cancel
+                self.calls.append(items)  # type: ignore[arg-type]
+                result: dict[str, str] = {}
+                for item in items:
+                    if item["text"] == "hot coolant":
+                        result[item["id"]] = "高温の冷却材"
+                        continue
+                    terms = {
+                        binding["source_term"]: binding["token"]
+                        for binding in item["term_bindings"]
+                    }
+                    hot_coolant = item["styled_bindings"][0]["token"]
+                    result[item["id"]] = (
+                        "核分裂性燃料と冷却材を受け取るのは"
+                        + terms["Mekanism Fission Reactors"]
+                        + "で、"
+                        + terms["nuclear waste"]
+                        + "と"
+                        + hot_coolant
+                        + "へ変換します。 "
+                    )
+                return result
+
+        source = (
+            "&eMekanism &dFission Reactors&r take fissile fuel and coolant, "
+            "and convert them into &4nuclear waste&r and &bhot coolant&r. "
+        )
+        expected = (
+            "核分裂性燃料と冷却材を受け取るのは&eMekanism &d核分裂炉&rで、"
+            "&4核廃棄物&rと&b高温の冷却材&rへ変換します。 "
+        )
+        glossary = GlossaryCatalog(
+            entries={
+                name: GlossaryEntry(
+                    source=name,
+                    target=target,
+                    key=key,
+                    mod_id="mekanism",
+                    translated=name != target,
+                    provenance="mekanism.jar!/assets/mekanism/lang/en_us.json",
+                )
+                # This synthetic catalog exercises the all-protected variant;
+                # the unmatched real-data case is covered separately below.
+                for name, target, key in (
+                    ("Mekanism", "Mekanism", "mod.display_name.mekanism"),
+                    ("Fission Reactor", "核分裂炉", "block.mekanism.fission_reactor"),
+                    ("nuclear waste", "核廃棄物", "chemical.mekanism.nuclear_waste"),
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            units = [
+                (
+                    "description",
+                    "quest.0533C0C07AE600FD.quest_desc[0]",
+                    source,
+                    "quest_description",
+                )
+            ]
+            project = _categorized_project(root, units)
+            client = MekanismCompoundClient()
+            adapter = RecordingAdapter()
+            progress: list[str] = []
+            outcome = TranslationService(client).translate(
+                project, adapter, project.default_output, "sk-test", "gpt-test",
+                glossary, TranslationOptions(),
+                progress=lambda _done, _total, message: progress.append(message),
+            )
+            reuse_client = PrefixClient()
+            reuse_adapter = RecordingAdapter()
+            reuse_project = _categorized_project(
+                root, units, existing={"description": expected},
+            )
+            reuse_outcome = TranslationService(reuse_client).translate(
+                reuse_project, reuse_adapter, reuse_project.default_output,
+                "sk-test", "gpt-test", glossary, TranslationOptions(),
+            )
+
+        self.assertEqual(len(client.calls), 1)
+        main_item = next(item for item in client.calls[0] if item.get("term_bindings"))
+        self.assertEqual(
+            [(binding["source_term"], binding["approved_output"])
+             for binding in main_item["term_bindings"]],
+            [("Mekanism Fission Reactors", "Mekanism 核分裂炉"),
+             ("nuclear waste", "核廃棄物")],
+        )
+        self.assertEqual(adapter.calls[0][1]["description"], expected)
+        self.assertFalse(any("再試行" in message for message in progress))
+        self.assertEqual((outcome.translated, outcome.reused), (1, 0))
+        self.assertEqual(reuse_client.calls, [])
+        self.assertEqual(reuse_adapter.calls[0][1]["description"], expected)
+        self.assertEqual((reuse_outcome.translated, reuse_outcome.reused), (0, 1))
+
+    def test_reported_mixed_compound_name_keeps_possessive_translatable(self) -> None:
+        class PyramidCompoundClient(PrefixClient):
+            def translate_batch(
+                self,
+                api_key: str,
+                model: str,
+                items: list[dict[str, Any]],
+                source_locale: str,
+                target_locale: str,
+                cancel: object = None,
+            ) -> dict[str, str]:
+                del api_key, model, source_locale, target_locale, cancel
+                self.calls.append(items)  # type: ignore[arg-type]
+                result: dict[str, str] = {}
+                for item in items:
+                    if item["text"] == "FTB Pyramid's ":
+                        result[item["id"]] = "FTB Pyramidの"
+                        continue
+                    terms = {
+                        binding["source_term"]: binding["token"]
+                        for binding in item["term_bindings"]
+                    }
+                    compound = item["styled_bindings"][0]["token"]
+                    result[item["id"]] = (
+                        compound
+                        + "の作成には"
+                        + terms["Empowered Emeradic Crystal Blocks"]
+                        + "が使われます。"
+                    )
+                return result
+
+        source = (
+            "&3Empowered Emeradic Crystal Blocks&r are used to make "
+            "&6FTB Pyramid's &dDissolved Potential&r."
+        )
+        expected = (
+            "&6FTB Pyramidの&dDissolved Potential&rの作成には"
+            "&3Empowered Emeradic Crystal Blocks&rが使われます。"
+        )
+        glossary = GlossaryCatalog(
+            entries={
+                name: GlossaryEntry(
+                    source=name,
+                    target=name,
+                    key=key,
+                    mod_id=mod_id,
+                    translated=False,
+                    provenance=(
+                        "kubejs/assets/ftbevolution/lang/en_us.json"
+                        if mod_id == "ftbevolution"
+                        else f"{mod_id}.jar!/assets/{mod_id}/lang/en_us.json"
+                    ),
+                )
+                for name, key, mod_id in (
+                    ("Empowered Emeradic Crystal Block",
+                     "block.actuallyadditions.empowered_emeradic_crystal_block",
+                     "actuallyadditions"),
+                    ("Dissolved Potential", "item.ftbevolution.dissolved_potential",
+                     "ftbevolution"),
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            units = [
+                ("description", "quest.0457FBD64D57E07B.quest_desc[0]",
+                 source, "quest_description")
+            ]
+            project = _categorized_project(root, units)
+            client = PyramidCompoundClient()
+            adapter = RecordingAdapter()
+            outcome = TranslationService(client).translate(
+                project, adapter, project.default_output, "sk-test", "gpt-test",
+                glossary, TranslationOptions(),
+            )
+            reuse_client = PrefixClient()
+            reuse_project = _categorized_project(
+                root, units, existing={"description": expected},
+            )
+            reuse_outcome = TranslationService(reuse_client).translate(
+                reuse_project, RecordingAdapter(), reuse_project.default_output,
+                "sk-test", "gpt-test", glossary, TranslationOptions(),
+            )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(len(client.calls[0]), 2)
+        item = next(item for item in client.calls[0] if item["id"] == "description")
+        self.assertNotIn("FTB Pyramid's ", item["text"])
+        self.assertEqual(item["styled_bindings"][0]["source_text"], "FTB Pyramid's &dDissolved Potential")
+        self.assertEqual(client.calls[0][0]["text"], "FTB Pyramid's ")
+        self.assertEqual(
+            [binding["source_term"] for binding in item["term_bindings"]],
+            ["Empowered Emeradic Crystal Blocks"],
+        )
+        self.assertEqual(adapter.calls[0][1]["description"], expected)
+        self.assertEqual((outcome.translated, outcome.reused), (1, 0))
+        self.assertEqual(reuse_client.calls, [])
+        self.assertEqual((reuse_outcome.translated, reuse_outcome.reused), (0, 1))
+
+    def test_reported_mekanism_unmatched_compound_bodies_are_all_translated(self) -> None:
+        class CompoundProseClient(PrefixClient):
+            def translate_batch(
+                self,
+                api_key: str,
+                model: str,
+                items: list[dict[str, Any]],
+                source_locale: str,
+                target_locale: str,
+                cancel: object = None,
+            ) -> dict[str, str]:
+                del api_key, model, source_locale, target_locale, cancel
+                self.calls.append(items)  # type: ignore[arg-type]
+                result: dict[str, str] = {}
+                for item in items:
+                    if item["text"] == "nuclear waste":
+                        result[item["id"]] = "核廃棄物"
+                    elif item["text"] == "hot coolant":
+                        result[item["id"]] = "高温の冷却材"
+                    elif item["text"] == "Mekanism ":
+                        result[item["id"]] = "Mekanism "
+                    elif item["text"] == "Fission Reactors":
+                        result[item["id"]] = "核分裂炉"
+                    else:
+                        styles = {
+                            binding["source_text"]: binding["token"]
+                            for binding in item["styled_bindings"]
+                        }
+                        result[item["id"]] = (
+                            "核分裂性燃料と冷却材を受け取るのは"
+                            + styles["Mekanism &dFission Reactors"]
+                            + "で、"
+                            + styles["nuclear waste"]
+                            + "と"
+                            + styles["hot coolant"]
+                            + "へ変換します。 "
+                        )
+                return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = _project(
+                "&eMekanism &dFission Reactors&r take fissile fuel and coolant, "
+                "and convert them into &4nuclear waste&r and &bhot coolant&r. ",
+                root,
+            )
+            client = CompoundProseClient()
+            adapter = RecordingAdapter()
+            TranslationService(client).translate(
+                project, adapter, project.default_output, "sk-test", "gpt-test",
+                GlossaryCatalog(), TranslationOptions(),
+            )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(len(client.calls[0]), 5)
+        main_item = next(item for item in client.calls[0] if item.get("styled_bindings"))
+        self.assertNotIn("Mekanism ", main_item["text"])
+        self.assertNotIn("Fission Reactors", main_item["text"])
+        self.assertTrue(any(item["text"] == "Mekanism " for item in client.calls[0]))
+        self.assertTrue(any(item["text"] == "Fission Reactors" for item in client.calls[0]))
+        self.assertNotIn("term_bindings", main_item)
+        self.assertEqual(
+            adapter.calls[0][1]["unit-1"],
+            "核分裂性燃料と冷却材を受け取るのは&eMekanism &d核分裂炉&rで、"
+            "&4核廃棄物&rと&b高温の冷却材&rへ変換します。 ",
+        )
+
+    def test_compound_term_token_corruption_never_reaches_writer(self) -> None:
+        glossary = GlossaryCatalog().with_source_preserved_terms(
+            ["Mekanism", "Fission Reactors"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = _project("Use &eMekanism &dFission Reactors&r.", root)
+            project.default_output.write_text("ORIGINAL", encoding="utf-8")
+            client = TamperingClient()
+            adapter = RecordingAdapter(write_file=True)
+            with self.assertRaises(TranslationError):
+                TranslationService(client).translate(
+                    project, adapter, project.default_output, "sk-test", "gpt-test",
+                    glossary, TranslationOptions(),
+                )
+
+            self.assertEqual(client.calls, 2)
+            self.assertEqual(adapter.calls, [])
+            self.assertEqual(project.default_output.read_text(encoding="utf-8"), "ORIGINAL")
 
     def test_term_split_by_formatting_is_one_provider_semantic_unit(self) -> None:
         source = (
@@ -1566,12 +1956,18 @@ class TranslationServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(len(client.calls), 1)
-        item = client.calls[0][0]
+        self.assertEqual(len(client.calls[0]), 2)
+        child = client.calls[0][0]
+        item = client.calls[0][1]
         self.assertEqual(
-            [binding["source_term"] for binding in item["term_bindings"]],
+            [binding["source_term"] for binding in child["term_bindings"]]
+            + [binding["source_term"] for binding in item["term_bindings"]],
             ["Spirit", " Crucible"],
         )
-        self.assertEqual(len(_PROTECTED_TOKEN.findall(item["text"])), 4)
+        self.assertEqual(len(_PROTECTED_TOKEN.findall(item["text"])), 2)
+        self.assertIn("Prefix ", child["text"])
+        self.assertNotIn("Prefix", item["text"])
+        self.assertEqual(adapter.calls[0][1]["description"], "&a訳:Prefix Spirit&r Crucible 訳:end")
         self.assertEqual((outcome.translated, outcome.reused), (1, 0))
 
     def test_grouped_term_inside_unclosed_format_scope_is_not_collapsed(self) -> None:
@@ -2518,14 +2914,14 @@ class TranslationServiceTests(unittest.TestCase):
         )
         self.assertEqual((outcome.translated, outcome.reused), (1, 0))
 
-    def test_complex_unclosed_formatting_stays_provider_visible_and_strict(self) -> None:
+    def test_unclosed_style_switches_are_fixed_but_layout_boundaries_stay_visible(self) -> None:
         cases = (
             (
                 "Text &aStyled &bSwitched",
-                2,
-                "訳:Text &aStyled &bSwitched",
+                0,
+                "訳:Text &a訳:Styled &b訳:Switched",
             ),
-            ("&aFirst &bSecond&r", 3, "&a訳:First &bSecond&r"),
+            ("&aFirst &bSecond&r", 1, "&a訳:First &b訳:Second&r"),
             ("&aLine 1\nLine 2", 2, "&a訳:Line 1\nLine 2"),
         )
         for source, token_count, expected in cases:
@@ -2546,10 +2942,15 @@ class TranslationServiceTests(unittest.TestCase):
                 )
 
                 self.assertEqual(
-                    len(_PROTECTED_TOKEN.findall(client.calls[0][0]["text"])),
+                    len(_PROTECTED_TOKEN.findall(client.calls[0][-1]["text"])),
                     token_count,
                 )
                 self.assertEqual(adapter.calls[0][1]["unit-1"], expected)
+                if source == "&aFirst &bSecond&r":
+                    self.assertEqual(len(client.calls[0]), 3)
+                    self.assertNotIn("First", client.calls[0][-1]["text"])
+                    self.assertNotIn("Second", client.calls[0][-1]["text"])
+                    self.assertEqual({item["text"] for item in client.calls[0][:-1]}, {"First ", "Second"})
 
     def test_reported_undergarden_body_omission_retry_explicitly_requires_the_verb(self) -> None:
         glossary = self.undergarden_title_glossary()

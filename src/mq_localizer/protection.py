@@ -11,7 +11,9 @@ from .domain import TranslationError
 
 
 _NEWLINE_OR_TAB_PATTERN = r"(?:\r\n|\r|\n|\t|\\(?:r\\n|n|r|t))"
-_ESCAPED_AMPERSAND_PATTERN = r"(?:\\&)"
+# FTB text also uses a closing backslash (``\&\``). Do not consume the
+# beginning of an adjacent escaped newline/tab or another escaped ampersand.
+_ESCAPED_AMPERSAND_PATTERN = r"(?:\\&(?:\\(?![nrt&]))?)"
 _FORMAT_CODE_PATTERN = (
     r"(?:§x(?:§[0-9A-Fa-f]){6}|&x(?:&[0-9A-Fa-f]){6})"
     r"|(?:[§&]#[0-9A-Fa-f]{6})"
@@ -41,6 +43,14 @@ _RESOURCE_ID_PATTERN_TEXT = (
 _PRINTF_PATTERN_TEXT = (
     r"%(?:\d+\$)?[-#+0,(<]*\d*(?:\.\d+)?(?:[tT][A-Za-z]|[A-Za-z%])"
 )
+# Numeric Minecraft rates are literals, not filesystem paths. Keep the value
+# and its slash unit together so a translated fragment cannot turn ``/tick``
+# into a new command/path by adding whitespace before it.
+_RATE_PATTERN_TEXT = (
+    rf"(?<![{_ASCII_WORD_CLASS}.,])(?:[0-9]{{1,3}}(?:,[0-9]{{3}})+|[0-9]+)"
+    rf"(?:\.[0-9]+)?[ ]*"
+    rf"(?:mB|FE|RF|EU|J)[ ]*/[ ]*(?:ticks?|t|s)(?![{_ASCII_WORD_CLASS}])"
+)
 _TEMPLATE_PATTERN_TEXT = (
     r"(?:\{@[^{}]+\})"
     r"|(?:\{(?:image|link|quest|chapter|task|item|icon|command):[^{}]*\})"
@@ -63,6 +73,7 @@ _SPECIAL_COMPONENT_PATTERN_TEXTS = (
     _HEX_ID_PATTERN_TEXT,
     _SLASH_PATH_PATTERN_TEXT,
     _RESOURCE_ID_PATTERN_TEXT,
+    _RATE_PATTERN_TEXT,
 )
 _SPECIAL_COMPONENT_PATTERNS = tuple(
     re.compile(rf"(?:{pattern})", re.IGNORECASE)
@@ -100,6 +111,21 @@ _FORMAT_CODE_AT_END = re.compile(
 )
 _FORMAT_CODE = re.compile(_FORMAT_CODE_PATTERN, re.IGNORECASE)
 
+# English function words are occasionally left beside an opaque terminology
+# token when the model changes word order (for example ``a__MQP__`` or
+# ``__MQP__per``). Only these complete ordinary words may be separated;
+# protected display names stay immutable. Unknown ASCII neighbours remain
+# strict failures.
+_BOUNDARY_REPAIR_WORDS = frozenset({
+    "a", "an", "the", "of", "per", "to", "and", "or", "in", "on",
+    "for", "with", "from", "by", "as", "at", "into", "onto", "via",
+})
+_SMALL_NUMBER_WORDS = dict(zip(
+    "zero one two three four five six seven eight nine ten eleven twelve "
+    "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split(),
+    map(str, range(21)), strict=True,
+))
+
 
 @dataclass(frozen=True, slots=True)
 class TermReplacement:
@@ -120,6 +146,64 @@ class _Span:
     term_group_id: int | None = None
 
 
+def _closed_styled_command_spans(text: str) -> tuple[_Span, ...]:
+    """Protect arguments when an entire closed style body is a command.
+
+    Slash-path recognition alone leaves executable arguments such as
+    ``party invite <username>`` translatable. Only a command beginning directly
+    after an opening stack and ending at its reset/white boundary qualifies;
+    surrounding prose, multiline text and internal colour switches do not.
+    """
+
+    shadowed_ranges = tuple(
+        match.span()
+        for pattern in (
+            _ESCAPED_AMPERSAND_PATTERN, _URL_PATTERN_TEXT, _TEMPLATE_PATTERN_TEXT,
+        )
+        for match in re.finditer(pattern, text, re.IGNORECASE)
+    )
+    formatting = [
+        match for match in _FORMAT_CODE.finditer(text)
+        if not any(start <= match.start() < end for start, end in shadowed_ranges)
+    ]
+    commands: dict[tuple[int, int], _Span] = {}
+    index = 0
+    while index < len(formatting):
+        opening = formatting[index]
+        index += 1
+        if _is_reset_format_token(opening.group()):
+            continue
+        body_start = opening.end()
+        while (
+            index < len(formatting)
+            and formatting[index].start() == body_start
+            and not _is_reset_format_token(formatting[index].group())
+        ):
+            body_start = formatting[index].end()
+            index += 1
+        if index >= len(formatting):
+            continue
+        close = formatting[index]
+        if not (
+            _is_reset_format_token(close.group())
+            or _is_neutral_white_format_token(close.group())
+        ):
+            continue
+        body = text[body_start : close.start()]
+        path = re.match(_SLASH_PATH_PATTERN_TEXT, body, re.IGNORECASE)
+        if (
+            not body.startswith("/")
+            or path is None
+            or body[path.end() : path.end() + 1] not in {"", " "}
+            or re.search(_NEWLINE_OR_TAB_PATTERN, body, re.IGNORECASE)
+        ):
+            continue
+        commands[(body_start, close.start())] = _Span(
+            body_start, close.start(), body, "special",
+        )
+    return tuple(commands.values())
+
+
 def _special_spans(text: str) -> tuple[_Span, ...]:
     """Return maximal non-overlapping syntax spans, including adjacent chains.
 
@@ -132,7 +216,9 @@ def _special_spans(text: str) -> tuple[_Span, ...]:
     """
 
     working = list(text)
-    spans: list[_Span] = []
+    spans = list(_closed_styled_command_spans(text))
+    for span in spans:
+        working[span.start : span.end] = " " * (span.end - span.start)
     while True:
         view = "".join(working)
         candidates = {
@@ -235,9 +321,7 @@ class _RestoredTrustedSpan:
 @dataclass(frozen=True, slots=True)
 class _FormattingGroup:
     placeholders: tuple[str, ...]
-    internal_segment_signatures: tuple[
-        tuple[bool, tuple[tuple[str, int], ...]], ...
-    ]
+    internal_segment_signatures: tuple[tuple[object, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +331,8 @@ class _FormattingSegment:
     strict_segment_signatures: tuple[
         tuple[bool, tuple[tuple[str, int], ...]], ...
     ]
+    trailing_placeholders: tuple[str, ...] = ()
+    trailing_signatures: tuple[tuple[object, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,7 +364,166 @@ class ProtectedText:
         )
         return self.term_placeholders + non_layout_special
 
-    def restore(self, translated: str) -> str:
+    def restore_source_term_spacing(self, translated: str) -> str:
+        """Restore a missing space beside a protected term conservatively.
+
+        A Japanese translation may keep the generic word ``mod`` as ``MOD``
+        but concatenate it with a protected name. The original adjacent word,
+        or a short English function word from the fixed allowlist, may be
+        separated. Original adjacent quantities may switch sides, and two
+        independently protected names may need a separator. Unknown affixes,
+        technical tokens, newlines and whitespace inside protected values are
+        untouched; strict restoration validators still run afterwards.
+        """
+
+        if not self.term_placeholders or (
+            Counter(_PLACEHOLDER_RE.findall(translated)) != Counter(self.replacements.keys())
+        ):
+            return translated
+        formats = frozenset(
+            token for token in self.special_placeholders
+            if _is_format_token(self.replacements[token])
+        )
+
+        def positions(text: str) -> tuple[
+            dict[str, tuple[int, int]], dict[int, int], dict[int, int],
+        ]:
+            tokens = {match.group(): match.span() for match in _PLACEHOLDER_RE.finditer(text)}
+            starts = {start: end for token, (start, end) in tokens.items() if token in formats}
+            ends = {end: start for token, (start, end) in tokens.items() if token in formats}
+            return tokens, starts, ends
+
+        source_tokens, source_starts, source_ends = positions(self.protected)
+        candidate_tokens, candidate_starts, candidate_ends = positions(translated)
+        term_at_candidate_start = {
+            span[0]: token for token, span in candidate_tokens.items()
+            if token in self.term_placeholders
+        }
+
+        def edge(
+            span: tuple[int, int], starts: dict[int, int],
+            ends: dict[int, int], right: bool,
+        ) -> int:
+            position = span[1] if right else span[0]
+            neighbors = starts if right else ends
+            while position in neighbors:
+                position = neighbors[position]
+            return position
+
+        insertions: dict[int, str] = {}
+        source_spans = dict(zip(self.term_placeholders, self.term_source_spans, strict=True))
+        term_groups = dict(zip(self.term_placeholders, self.term_group_ids, strict=True))
+        for token in self.term_placeholders:
+            source_start, source_end = source_spans[token]
+            value = self.original[source_start:source_end]
+            if not value:
+                continue
+            source_left = edge(source_tokens[token], source_starts, source_ends, False)
+            source_right = edge(source_tokens[token], source_starts, source_ends, True)
+            # Sentinels stop matching at every other protected value, including
+            # newlines and templates. They must not become ordinary whitespace.
+            source_prefix = _PLACEHOLDER_RE.sub("\0", self.protected[:source_left])
+            source_suffix = _PLACEHOLDER_RE.sub("\0", self.protected[source_right:])
+            left_word = re.search(r"([A-Za-z0-9_]+)( +)$", source_prefix)
+            right_word = re.match(r"( +)([A-Za-z0-9_]+)", source_suffix)
+            quantities = {
+                _SMALL_NUMBER_WORDS.get(word.casefold(), word)
+                for word in (
+                    left_word.group(1) if left_word else "",
+                    right_word.group(2) if right_word else "",
+                )
+                if word.isdecimal() or word.casefold() in _SMALL_NUMBER_WORDS
+            }
+            for right in (False, True):
+                character = value[-1] if right else value[0]
+                if not (character.isascii() and (character.isalnum() or character == "_")):
+                    continue
+                candidate_edge = edge(candidate_tokens[token], candidate_starts, candidate_ends, right)
+                if right:
+                    candidate_suffix = _PLACEHOLDER_RE.sub("\0", translated[candidate_edge:])
+                    source_match = right_word
+                    candidate_match = re.match(r"[A-Za-z0-9_]+", candidate_suffix)
+                else:
+                    candidate_prefix = _PLACEHOLDER_RE.sub("\0", translated[:candidate_edge])
+                    source_match = left_word
+                    candidate_match = re.search(r"[A-Za-z0-9_]+$", candidate_prefix)
+                if candidate_match is None:
+                    # Two independently protected names can become adjacent
+                    # when a translated conjunction is omitted. Restore their
+                    # boundary, but never split fragments of one logical name.
+                    peer = term_at_candidate_start.get(candidate_edge) if right else None
+                    if peer and (
+                        term_groups[token] is None or term_groups[token] != term_groups[peer]
+                    ):
+                        target, peer_target = self.replacements[token], self.replacements[peer]
+                        if (
+                            target and peer_target
+                            and target[-1].isascii() and target[-1].isalnum()
+                            and peer_target[0].isascii() and peer_target[0].isalnum()
+                            and (source_right == len(self.protected)
+                                 or not re.match(r"[A-Za-z0-9_]", self.protected[source_right:]))
+                        ):
+                            insertions[candidate_edge] = " "
+                    continue
+                # Another protected value is not ordinary source prose.
+                candidate_word = candidate_match.group()
+                if candidate_word.isdecimal() and candidate_word in quantities:
+                    # English quantities precede names; Japanese counts often
+                    # follow them: ``20 Honey Treats`` -> ``Honey Treats 20個``.
+                    insertions[candidate_edge] = " "
+                    continue
+                if source_match is None:
+                    continue
+                whitespace, word = source_match.groups() if right else source_match.groups()[::-1]
+                if _PLACEHOLDER_RE.search(word):
+                    continue
+                if candidate_word.casefold() == word.casefold():
+                    insertions[candidate_edge] = whitespace
+                elif candidate_word.casefold() in _BOUNDARY_REPAIR_WORDS:
+                    # Keep the correction narrow: only a plain ASCII function
+                    # word may be separated from a protected term. This never
+                    # changes the protected value or accepts a new suffix.
+                    insertions[candidate_edge] = " "
+        for position, whitespace in sorted(insertions.items(), reverse=True):
+            translated = translated[:position] + whitespace + translated[position:]
+        return translated
+
+    def remove_adjacent_term_echoes(self, translated: str) -> str:
+        """Remove an exact reference-name echo glued to its own opaque token.
+
+        A response such as ``Mekanism__MQP_0000__の`` repeats the name instead
+        of replacing the token. Only a complete source/approved spelling is
+        eligible, with an intact token inventory; unknown affixes, separated
+        words and fragments of a compound name are not repaired.
+        """
+
+        if Counter(_PLACEHOLDER_RE.findall(translated)) != Counter(self.replacements.keys()):
+            return translated
+        grouped = Counter(group for group in self.term_group_ids if group is not None)
+        for token, (start, end), group in zip(
+            self.term_placeholders, self.term_source_spans, self.term_group_ids, strict=True,
+        ):
+            if group is not None and grouped[group] > 1:
+                continue
+            names = {self.original[start:end], self.replacements[token]}
+            for name in sorted(names, key=len, reverse=True):
+                if len(name) < 2 or not any(c.isalnum() for c in name) or special_tokens(name):
+                    continue
+                # Never erase literal repetition already present beside this
+                # source occurrence. Formatting boundaries are not crossed.
+                if self.original[:start].endswith(name) or self.original[end:].startswith(name):
+                    continue
+                translated = re.sub(
+                    rf"(?<![A-Za-z0-9_]){re.escape(name)}(?={re.escape(token)})",
+                    "", translated,
+                )
+                translated = re.sub(
+                    rf"(?<={re.escape(token)}){re.escape(name)}(?![A-Za-z0-9_])",
+                    "", translated,
+                )
+        return translated
+
+    def restore(self, translated: str, *, allow_omitted_determiners: bool = False) -> str:
         observed = _PLACEHOLDER_RE.findall(translated)
         expected = list(self.replacements)
         if Counter(observed) != Counter(expected):
@@ -322,12 +567,28 @@ class ProtectedText:
             translated,
             self.structural_placeholders,
         )
+        source_segments = (
+            [without_leading_styled_article(segment, self.replacements) for segment in
+             _split_on_placeholders(self.protected, self.structural_placeholders)]
+            if allow_omitted_determiners else None
+        )
         if self.structural_placeholders:
             translated_signatures = tuple(
-                _segment_signature(segment) for segment in translated_segments
+                _segment_signature(segment, self.term_placeholders)
+                for segment in translated_segments
             )
+            expected_signatures = self.layout_segment_signatures
+            if source_segments is not None:
+                expected_signatures = tuple(
+                    observed if observed == _segment_signature(
+                        _without_term_determiners(part, self.term_placeholders), self.term_placeholders,
+                    ) else expected
+                    for part, expected, observed in zip(
+                        source_segments, expected_signatures, translated_signatures, strict=True,
+                    )
+                )
             if not _layout_segment_signatures_match(
-                self.layout_segment_signatures,
+                expected_signatures,
                 translated_signatures,
                 self.structural_placeholders,
                 frozenset(self.flexible_structural_placeholders),
@@ -339,6 +600,8 @@ class ProtectedText:
             translated_segments,
             self.formatting_segments,
             self.replacements,
+            self.term_placeholders,
+            source_segments=source_segments,
         )
 
         result_chunks: list[str] = []
@@ -575,7 +838,17 @@ class TokenProtector:
         chunks.append(text[cursor:])
 
         protected = "".join(chunks)
-        structural_placeholders = tuple(fixed_layout_placeholders)
+        # A literal ampersand inside a complete style scope belongs to that
+        # scope, not to the line layout. Preserve its nested left/right layout
+        # in the group's signature instead of cutting the opening from reset.
+        scoped_escapes = _closed_scope_escaped_placeholders(
+            protected, tuple(fixed_layout_placeholders), replacements,
+            tuple(term_placeholders),
+        )
+        structural_placeholders = tuple(
+            placeholder for placeholder in fixed_layout_placeholders
+            if placeholder not in scoped_escapes
+        )
         flexible_structural_placeholders: list[str] = []
         grouped_term_spans: dict[int, list[tuple[int, int]]] = {}
         for source_span, group_id in zip(
@@ -591,7 +864,7 @@ class TokenProtector:
             special_values,
             strict=True,
         ):
-            if value != r"\&" or placeholder not in structural_placeholders:
+            if not _is_escaped_ampersand_token(value) or placeholder not in structural_placeholders:
                 continue
             special_start, special_end = source_span
             if any(
@@ -605,11 +878,11 @@ class TokenProtector:
             structural_placeholders,
         )
         layout_segment_signatures = tuple(
-            _segment_signature(segment)
+            _segment_signature(segment, term_placeholders)
             for segment in protected_segments
         )
         formatting_segments = tuple(
-            _build_formatting_segment(segment, replacements)
+            _build_formatting_segment(segment, replacements, term_placeholders)
             for segment in protected_segments
         )
 
@@ -735,7 +1008,23 @@ def _validate_term_boundaries(
         if (restored_left and not original_left) or (
             restored_right and not original_right
         ):
-            raise TranslationError("Mod名または公式用語のplaceholderに文字が連結されました")
+            sides = []
+            if restored_left and not original_left:
+                before = span.start
+                while before and restored_formatting[before - 1]:
+                    before -= 1
+                match = re.search(r"[A-Za-z0-9_]+$", restored[:before])
+                sides.append(f"直前 {match.group()[-24:]!r}" if match else "直前")
+            if restored_right and not original_right:
+                after = span.end
+                while after < len(restored) and restored_formatting[after]:
+                    after += 1
+                match = re.match(r"[A-Za-z0-9_]+", restored[after:])
+                sides.append(f"直後 {match.group()[:24]!r}" if match else "直後")
+            raise TranslationError(
+                "Mod名または公式用語のplaceholderに文字が連結されました"
+                f"（原文用語: {source_value[:80]!r} / {'・'.join(sides)}の英数字）"
+            )
 
 
 _SPECIAL_PROVENANCE_FAILURE = (
@@ -1079,9 +1368,10 @@ def protected_layout_signature(
 
     Newlines and tabs retain their exact segment. Escaped ampersands do too,
     except that prose may move across an ampersand held between two fragments
-    of the same protected name. A simple ``format...reset`` group may move as
-    one unit inside a segment. Orphan resets, unclosed codes, and complex
-    mid-body style changes retain strict source positions.
+    of the same protected name. A reset-closed group may move as one unit
+    inside a segment, including scopes with internal colour changes. Those
+    internal boundaries and their contents remain fixed relative to each
+    other. Orphan resets and unclosed codes retain strict source positions.
     """
 
     protected = TokenProtector().protect(text, terminology, term_spans)
@@ -1107,6 +1397,7 @@ def protected_layout_signature(
                 segment,
                 protected.replacements,
                 special,
+                protected.term_placeholders,
             )
         )
         formatting_signatures.append(
@@ -1115,6 +1406,7 @@ def protected_layout_signature(
                 formatting,
                 protected.replacements,
                 special,
+                protected.term_placeholders,
             )
         )
     component_body_by_segment: dict[int, bool] = {}
@@ -1168,68 +1460,166 @@ def _formatting_placeholder_matches(
     return matches
 
 
+def _is_escaped_ampersand_token(value: str) -> bool:
+    return value in {r"\&", "\\&\\"}
+
+
+def _closed_scope_escaped_placeholders(
+    text: str,
+    structural_placeholders: tuple[str, ...],
+    replacements: Mapping[str, str],
+    term_placeholders: Iterable[str] = (),
+) -> frozenset[str]:
+    escapes = frozenset(
+        placeholder for placeholder in structural_placeholders
+        if _is_escaped_ampersand_token(replacements[placeholder])
+    )
+    if not escapes:
+        return frozenset()
+    hard_boundaries = tuple(
+        placeholder for placeholder in structural_placeholders
+        if placeholder not in escapes
+    )
+    scoped: set[str] = set()
+    for segment in _split_on_placeholders(text, hard_boundaries):
+        formatting = _build_formatting_segment(segment, replacements, term_placeholders)
+        for group in formatting.movable_groups:
+            start = segment.find(group.placeholders[0])
+            end = segment.find(group.placeholders[-1], start)
+            scoped.update(
+                token for token in _PLACEHOLDER_RE.findall(segment[start:end])
+                if token in escapes
+            )
+    return frozenset(scoped)
+
+
 def _build_formatting_segment(
     segment: str,
     replacements: Mapping[str, str],
+    term_placeholders: Iterable[str] = (),
 ) -> _FormattingSegment:
+    term_placeholders = frozenset(term_placeholders)
     matches = _formatting_placeholder_matches(segment, replacements)
     source_sequence = tuple(placeholder for placeholder, _start, _end in matches)
     if not matches:
         return _FormattingSegment((), (), ())
 
     movable_groups: list[_FormattingGroup] = []
+    trailing_placeholders: tuple[str, ...] = ()
+    trailing_signatures: tuple[tuple[object, ...], ...] = ()
     requires_strict_layout = False
     index = 0
     while index < len(matches):
         first = matches[index]
         if _is_reset_format_token(replacements[first[0]]):
+            tail = tuple(item[0] for item in matches[index:])
+            if (
+                movable_groups
+                and all(_is_reset_format_token(replacements[token]) for token in tail)
+                and segment[first[1]:] == "".join(tail)
+            ):
+                # Redundant terminal resets do not make preceding closed
+                # scopes unsafe to move. Keep the resets anchored at the end.
+                trailing_placeholders = tail
+                trailing_signatures = _trailing_formatting_signatures(
+                    segment, tail, replacements, term_placeholders=term_placeholders,
+                )
+                break
             requires_strict_layout = True
             break
 
         group = [first]
         index += 1
-        # Consecutive opening codes such as ``&l&5`` form one opening stack.
-        # A later code after body text (``&5A &3B&r``) is a complex layout and
-        # deliberately retains the old fixed-position validation.
+        # A reset closes the entire scope, including internal colour changes
+        # such as ``&eMekanism &dFission Reactors&r``. Keep every internal
+        # boundary in the group so its contents cannot cross colours even
+        # when the complete scope moves in target-language word order. ``&f`` is
+        # also commonly used by FTB quest text as the neutral white boundary
+        # that closes a coloured name (``&dName&f``).  Treat it as that
+        # boundary only after a non-empty body; at the beginning of a scope it
+        # remains an ordinary opening colour (``&fWhite&r``).
         while index < len(matches):
             candidate = matches[index]
             if _is_reset_format_token(replacements[candidate[0]]):
                 break
-            if segment[group[-1][2] : candidate[1]]:
-                requires_strict_layout = True
-                break
+            body_before_candidate = segment[group[-1][2] : candidate[1]]
+            if body_before_candidate and _is_neutral_white_format_token(
+                replacements[candidate[0]]
+            ):
+                # ``&o...&cName&f!&r`` uses white as an internal colour and
+                # reset as the actual close. Treat white as a terminal boundary
+                # only when it is not followed by visible text before reset.
+                next_match = matches[index + 1] if index + 1 < len(matches) else None
+                if not (
+                    next_match is not None
+                    and _is_reset_format_token(replacements[next_match[0]])
+                    and segment[candidate[2] : next_match[1]].strip()
+                ):
+                    break
             group.append(candidate)
             index += 1
-        if requires_strict_layout:
-            break
         if index >= len(matches):
+            # A simple unclosed tail does not invalidate earlier reset-closed
+            # scopes. Keep the tail anchored after them, including every
+            # opening code and the exact protected contents of its body.
+            if (
+                movable_groups
+                and segment[group[-1][2] :].strip()
+                and all(left[2] == right[1] for left, right in zip(group, group[1:]))
+                and any(_is_color_format_token(replacements[item[0]]) for item in group)
+            ):
+                trailing_placeholders = tuple(item[0] for item in group)
+                trailing_signatures = _trailing_formatting_signatures(
+                    segment, trailing_placeholders, replacements,
+                    term_placeholders=term_placeholders,
+                )
+                break
             requires_strict_layout = True
             break
         reset = matches[index]
-        if not _is_reset_format_token(replacements[reset[0]]):
+        neutral_white_close = _is_neutral_white_format_token(
+            replacements[reset[0]]
+        )
+        if not (_is_reset_format_token(replacements[reset[0]]) or neutral_white_close):
             requires_strict_layout = True
             break
         group.append(reset)
-        body_signature = _segment_signature(segment[group[-2][2] : reset[1]])
-        if not body_signature[0] and not body_signature[1]:
+        body = segment[group[-2][2] : reset[1]]
+        if not body.strip():
             requires_strict_layout = True
             break
         movable_groups.append(
             _FormattingGroup(
                 placeholders=tuple(part[0] for part in group),
                 internal_segment_signatures=tuple(
-                    _segment_signature(segment[left[2] : right[1]])
+                    _formatting_body_signature(
+                        segment[left[2] : right[1]], replacements,
+                        term_placeholders=term_placeholders,
+                    )
                     for left, right in zip(group, group[1:])
                 ),
             )
         )
         index += 1
+    if not requires_strict_layout and any(
+        _is_neutral_white_format_token(replacements[group.placeholders[-1]])
+        for group in movable_groups
+    ):
+        # White boundaries can be movable only when every group sets its own
+        # colour. A modifier-only stack inherits the preceding colour even
+        # across prose, and could gain a white predecessor after reordering.
+        # This segment-wide, order-independent rule also gives a restored
+        # translation the same classification when checked later for reuse.
+        requires_strict_layout = any(
+            not _formatting_group_sets_initial_color(group, segment, replacements)
+            for group in movable_groups
+        )
     if requires_strict_layout:
         return _FormattingSegment(
             source_sequence=source_sequence,
             movable_groups=(),
             strict_segment_signatures=tuple(
-                _segment_signature(part)
+                _segment_signature(part, term_placeholders)
                 for part in _split_on_placeholders(segment, source_sequence)
             ),
         )
@@ -1237,6 +1627,8 @@ def _build_formatting_segment(
         source_sequence=source_sequence,
         movable_groups=tuple(movable_groups),
         strict_segment_signatures=(),
+        trailing_placeholders=trailing_placeholders,
+        trailing_signatures=trailing_signatures,
     )
 
 
@@ -1244,15 +1636,20 @@ def _validate_formatting_segments(
     translated_segments: list[str],
     expected_segments: tuple[_FormattingSegment, ...],
     replacements: Mapping[str, str],
+    term_placeholders: Iterable[str] = (),
+    *,
+    source_segments: list[str] | None = None,
 ) -> None:
+    term_placeholders = frozenset(term_placeholders)
     if len(translated_segments) != len(expected_segments):
         raise TranslationError("内部エラー: 装飾コードのsegmentを再検証できません")
 
-    for translated, expected in zip(
+    for segment_index, (translated, expected) in enumerate(zip(
         translated_segments,
         expected_segments,
         strict=True,
-    ):
+    )):
+        original = source_segments[segment_index] if source_segments is not None else None
         matches = _formatting_placeholder_matches(translated, replacements)
         sequence = tuple(placeholder for placeholder, _start, _end in matches)
         if Counter(sequence) != Counter(expected.source_sequence):
@@ -1268,16 +1665,41 @@ def _validate_formatting_segments(
                     "単純に閉じていない装飾コードの位置・順序が変更されました"
                 )
             signatures = tuple(
-                _segment_signature(part)
+                _segment_signature(part, term_placeholders)
                 for part in _split_on_placeholders(translated, sequence)
             )
-            if signatures != expected.strict_segment_signatures:
+            expected_signatures = expected.strict_segment_signatures
+            if original is not None:
+                original_parts = _split_on_placeholders(original, sequence)
+                expected_signatures = tuple(
+                    observed if observed == _segment_signature(
+                        _without_term_determiners(part, term_placeholders), term_placeholders,
+                    ) else source_signature
+                    for part, source_signature, observed in zip(
+                        original_parts, expected_signatures, signatures, strict=True,
+                    )
+                )
+            if signatures != expected_signatures:
                 raise TranslationError(
                     "単純に閉じていない装飾コードをまたいで本文または保護対象が移動しました"
                 )
             continue
 
         sequence_index = {placeholder: index for index, placeholder in enumerate(sequence)}
+        if expected.trailing_placeholders:
+            tail = expected.trailing_placeholders
+            if sequence[-len(tail) :] != tail:
+                raise TranslationError("末尾の未閉鎖装飾コードが前の装飾範囲へ移動しました")
+            signatures = _trailing_formatting_signatures(
+                translated, tail, replacements, term_placeholders=term_placeholders,
+            )
+            if signatures != expected.trailing_signatures and not (
+                original is not None and signatures == _trailing_formatting_signatures(
+                    _without_term_determiners(original, term_placeholders), tail, replacements,
+                    term_placeholders=term_placeholders,
+                )
+            ):
+                raise TranslationError("末尾の未閉鎖装飾をまたいで本文または保護対象が移動しました")
         match_by_placeholder = {
             placeholder: (start, end) for placeholder, start, end in matches
         }
@@ -1289,23 +1711,102 @@ def _validate_formatting_segments(
                     "装飾コードの開始とリセットが別の装飾範囲へ分離されました"
                 )
             internal_signatures = tuple(
-                _segment_signature(
+                _formatting_body_signature(
                     translated[
                         match_by_placeholder[left][1] : match_by_placeholder[right][0]
-                    ]
+                    ],
+                    replacements,
+                    term_placeholders=term_placeholders,
                 )
                 for left, right in zip(group.placeholders, group.placeholders[1:])
             )
-            if internal_signatures != group.internal_segment_signatures:
+            expected_signatures = group.internal_segment_signatures
+            if original is not None:
+                expected_signatures = tuple(
+                    observed if observed == _formatting_body_signature(
+                        _without_term_determiners(
+                            original[original.index(left) + len(left):original.index(right)],
+                            term_placeholders,
+                        ), replacements, term_placeholders=term_placeholders,
+                    ) else source_signature
+                    for left, right, source_signature, observed in zip(
+                        group.placeholders[:-1], group.placeholders[1:],
+                        expected_signatures, internal_signatures, strict=True,
+                    )
+                )
+            if internal_signatures != expected_signatures:
                 raise TranslationError(
                     "装飾コードで囲まれた本文または保護対象が別の装飾範囲へ移動しました"
                 )
+
+
+def without_leading_styled_article(
+    text: str, replacements: Mapping[str, str] | None = None,
+) -> str:
+    """Validation-only variant for ``The &6Name`` / ``&fThe &bName``.
+
+    Call only for English sources. The article must be the entire leading
+    text slot, followed by an opening style and a nonempty content slot. All
+    codes/whitespace remain intact; ordinary prose, resets and line breaks
+    are not swallowed. Supports raw text (reuse) and protected text (live).
+    """
+
+    if re.search(_NEWLINE_OR_TAB_PATTERN, text):
+        return text
+
+    def opening_end(position: int) -> int | None:
+        match = (_PLACEHOLDER_RE if replacements is not None else _FORMAT_CODE).match(text, position)
+        if match is None:
+            return None
+        value = replacements.get(match.group(), "") if replacements is not None else match.group()
+        if not _is_format_token(value) or _is_reset_format_token(value):
+            return None
+        return match.end()
+
+    cursor = 0
+    while (end := opening_end(cursor)) is not None:
+        cursor = end
+        while cursor < len(text) and text[cursor] == " ":
+            cursor += 1
+    article = re.compile(r"(a|an|the) +", re.IGNORECASE).match(text, cursor)
+    if article is None or (body_start := opening_end(article.end())) is None:
+        return text
+    if replacements is None:
+        body = _FORMAT_CODE.sub("", text[body_start:])
+    else:
+        body = _PLACEHOLDER_RE.sub(
+            lambda match: "" if _is_format_token(replacements.get(match.group(), "")) else match.group(),
+            text[body_start:],
+        )
+    if not any(character.isalnum() for character in body):
+        return text
+    return text[:article.start(1)] + text[article.end(1):]
+
+
+def _without_term_determiners(text: str, term_placeholders: Iterable[str]) -> str:
+    """A/an/the may vanish only beside a name in the SAME formatting slot.
+
+    This is a validation-only source variant; no source/output is rewritten.
+    Ordinary prose, possessives, bare articles and technical tokens stay strict.
+    Callers enable it only for English source text.
+    """
+
+    if not set(_PLACEHOLDER_RE.findall(text)).intersection(term_placeholders):
+        return text
+    visible = _PLACEHOLDER_RE.sub(lambda match: " " * len(match.group()), text)
+    words = list(re.finditer(r"\w+", visible))
+    if not words or any(word.group().casefold() not in {"a", "an", "the"} for word in words):
+        return text
+    for word in reversed(words):
+        text = text[:word.start()] + text[word.end():]
+    return text
 
 
 def _canonical_segment_signature(
     segment: str,
     replacements: Mapping[str, str],
     special_placeholders: frozenset[str],
+    term_placeholders: Iterable[str] = (),
 ) -> tuple[bool, tuple[tuple[str, str], ...]]:
     syntax: list[tuple[str, str]] = []
     for placeholder in _PLACEHOLDER_RE.findall(segment):
@@ -1317,7 +1818,8 @@ def _canonical_segment_signature(
         )
     visible = _PLACEHOLDER_RE.sub("", segment)
     return (
-        any(character.isalnum() for character in visible),
+        any(character.isalnum() for character in visible)
+        or has_protected_possessive_suffix(segment, term_placeholders),
         tuple(sorted(syntax)),
     )
 
@@ -1327,7 +1829,9 @@ def _canonical_formatting_signature(
     formatting: _FormattingSegment,
     replacements: Mapping[str, str],
     special_placeholders: frozenset[str],
+    term_placeholders: Iterable[str] = (),
 ) -> tuple[object, ...]:
+    term_placeholders = frozenset(term_placeholders)
     if not formatting.source_sequence:
         return ("groups", ())
     if formatting.strict_segment_signatures:
@@ -1335,7 +1839,9 @@ def _canonical_formatting_signature(
             "strict",
             tuple(replacements[item] for item in formatting.source_sequence),
             tuple(
-                _canonical_segment_signature(part, replacements, special_placeholders)
+                _canonical_segment_signature(
+                    part, replacements, special_placeholders, term_placeholders,
+                )
                 for part in _split_on_placeholders(
                     segment,
                     formatting.source_sequence,
@@ -1356,24 +1862,140 @@ def _canonical_formatting_signature(
             (
                 tuple(replacements[item] for item in group.placeholders),
                 tuple(
-                    _canonical_segment_signature(
+                    _formatting_body_signature(
                         segment[
                             match_by_placeholder[left][1] : match_by_placeholder[right][0]
                         ],
                         replacements,
                         special_placeholders,
+                        term_placeholders,
                     )
                     for left, right in zip(group.placeholders, group.placeholders[1:])
                 ),
             )
         )
+    if formatting.trailing_placeholders:
+        tail = formatting.trailing_placeholders
+        return (
+            "groups_with_tail",
+            tuple(sorted(groups)),
+            tuple(replacements[token] for token in tail),
+            _trailing_formatting_signatures(
+                segment, tail, replacements, special_placeholders, term_placeholders,
+            ),
+        )
     return "groups", tuple(sorted(groups))
 
 
-def _segment_signature(segment: str) -> tuple[bool, tuple[tuple[str, int], ...]]:
+def _trailing_formatting_signatures(
+    text: str,
+    trailing_placeholders: tuple[str, ...],
+    replacements: Mapping[str, str],
+    canonical_specials: frozenset[str] | None = None,
+    term_placeholders: Iterable[str] = (),
+) -> tuple[tuple[object, ...], ...]:
+    term_placeholders = frozenset(term_placeholders)
+    prefix, *tail_parts = _split_on_placeholders(text, trailing_placeholders)
+    # Prefix scopes have their own nested validation and may reorder. Only
+    # their overall content must remain on this side of the terminal style.
+    prefix_signature = (
+        _segment_signature(prefix, term_placeholders) if canonical_specials is None
+        else _canonical_segment_signature(
+            prefix, replacements, canonical_specials, term_placeholders,
+        )
+    )
+    return (
+        prefix_signature,
+        *(
+            _formatting_body_signature(
+                part, replacements, canonical_specials, term_placeholders,
+            )
+            for part in tail_parts
+        ),
+    )
+
+
+def _formatting_body_signature(
+    text: str,
+    replacements: Mapping[str, str],
+    canonical_specials: frozenset[str] | None = None,
+    term_placeholders: Iterable[str] = (),
+) -> tuple[object, ...]:
+    """Keep literal separators and symbol labels inside their colour scope.
+
+    A scope may move as a whole, but text and protected values cannot cross
+    an escaped ampersand inside it. Symbol-only labels such as ``+`` retain
+    their exact characters instead of being confused with an empty body.
+    """
+
+    term_placeholders = frozenset(term_placeholders)
+    escapes = tuple(
+        token for token in _PLACEHOLDER_RE.findall(text)
+        if _is_escaped_ampersand_token(replacements.get(token, ""))
+    )
+    signatures: list[tuple[object, ...]] = []
+    for part in _split_on_placeholders(text, escapes):
+        signature = (
+            _segment_signature(part, term_placeholders) if canonical_specials is None
+            else _canonical_segment_signature(
+                part, replacements, canonical_specials, term_placeholders,
+            )
+        )
+        literal = (
+            part if part.strip() and not signature[0] and not signature[1]
+            else ""
+        )
+        if not signature[0] and any(
+            token not in term_placeholders
+            and replacements.get(token, "").startswith("/")
+            for token in _PLACEHOLDER_RE.findall(part)
+        ):
+            # A command's arguments are already one immutable value. Do not
+            # allow the provider to append punctuation or whitespace inside
+            # its styled scope (alphanumeric additions fail the body check).
+            literal = _PLACEHOLDER_RE.sub("", part)
+        signatures.append((signature, literal))
+    return (
+        escapes if canonical_specials is None
+        else tuple(replacements[token] for token in escapes),
+        tuple(signatures),
+    )
+
+
+def has_protected_possessive_suffix(
+    text: str,
+    term_placeholders: Iterable[str],
+) -> bool:
+    """Identify a bare possessive after a protected name, not a symbol label.
+
+    This supplements alphanumeric-body detection: ordinary prose and ``'s``
+    already contain linguistic characters. Only a single apostrophe may be
+    left outside protected values here, so quoted names and punctuation-only
+    labels cannot become translatable text. Technical/literal placeholders
+    never qualify unless explicitly identified as protected names.
+    """
+
+    visible = _PLACEHOLDER_RE.sub("", text).strip()
+    if visible not in {"'", "\u2019"}:
+        return False
+    terms = frozenset(term_placeholders)
+    return any(
+        match.group() in terms
+        and text[match.end() : match.end() + 1] in {"'", "\u2019"}
+        for match in _PLACEHOLDER_RE.finditer(text)
+    )
+
+
+def _segment_signature(
+    segment: str,
+    term_placeholders: Iterable[str] = (),
+) -> tuple[bool, tuple[tuple[str, int], ...]]:
     placeholders = _PLACEHOLDER_RE.findall(segment)
     visible = _PLACEHOLDER_RE.sub("", segment)
-    has_meaningful_body = any(character.isalnum() for character in visible)
+    has_meaningful_body = (
+        any(character.isalnum() for character in visible)
+        or has_protected_possessive_suffix(segment, term_placeholders)
+    )
     return has_meaningful_body, tuple(sorted(Counter(placeholders).items()))
 
 
@@ -1443,3 +2065,39 @@ def _is_fixed_layout_token(value: str) -> bool:
 
 def _is_reset_format_token(value: str) -> bool:
     return len(value) == 2 and value[0] in {"§", "&"} and value[1].lower() == "r"
+
+
+def _is_neutral_white_format_token(value: str) -> bool:
+    """Return whether a legacy code restores FTB quest prose to white.
+
+    This is intentionally separate from ``_is_reset_format_token``: a leading
+    ``&f`` opens a white span, while a later ``&f`` after coloured content is
+    the conventional local boundary used by FTB quest descriptions.
+    """
+
+    return len(value) == 2 and value[0] in {"§", "&"} and value[1].lower() == "f"
+
+
+def _is_color_format_token(value: str) -> bool:
+    """Return whether a complete code explicitly sets a legacy or RGB colour."""
+
+    # FTB's &z/§z explicitly sets the rainbow colour (not a modifier which
+    # inherits the preceding colour), just like legacy/RGB colour codes.
+    return _is_format_token(value) and value[1].lower() in "0123456789abcdefx#z"
+
+
+def _formatting_group_sets_initial_color(
+    group: _FormattingGroup,
+    segment: str,
+    replacements: Mapping[str, str],
+) -> bool:
+    """Check the opening stack, before any ordinary or protected content."""
+
+    cursor = segment.find(group.placeholders[0])
+    for placeholder in group.placeholders[:-1]:
+        if not segment.startswith(placeholder, cursor):
+            return False
+        if _is_color_format_token(replacements[placeholder]):
+            return True
+        cursor += len(placeholder)
+    return False

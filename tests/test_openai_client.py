@@ -37,6 +37,7 @@ from mq_localizer.openai_client import (  # noqa: E402
 )
 from mq_localizer.protection import TokenProtector  # noqa: E402
 from mq_localizer.unicode_safety import JAPANESE_UNICODE_INSTRUCTIONS  # noqa: E402
+from mq_localizer.translation_quality import JAPANESE_WORD_ORDER_INSTRUCTIONS  # noqa: E402
 
 
 class SequenceTransport:
@@ -1443,7 +1444,9 @@ class OpenAIResponseTests(unittest.TestCase):
             + "\n\n"
             + IMMUTABLE_TRANSLATION_PROTOCOL
             + "\n\n"
-            + JAPANESE_UNICODE_INSTRUCTIONS,
+            + JAPANESE_UNICODE_INSTRUCTIONS
+            + "\n\n"
+            + JAPANESE_WORD_ORDER_INSTRUCTIONS,
         )
 
     def test_token_position_enum_definition_is_reused_for_same_count(self) -> None:
@@ -2030,7 +2033,9 @@ class OpenAIResponseTests(unittest.TestCase):
             + "\n\n"
             + IMMUTABLE_TRANSLATION_PROTOCOL
             + "\n\n"
-            + JAPANESE_UNICODE_INSTRUCTIONS,
+            + JAPANESE_UNICODE_INSTRUCTIONS
+            + "\n\n"
+            + JAPANESE_WORD_ORDER_INSTRUCTIONS,
         )
         self.assertLess(
             payload["instructions"].index(rendered_custom),

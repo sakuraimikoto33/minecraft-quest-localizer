@@ -3885,28 +3885,27 @@ class ModLanguageScannerTests(unittest.TestCase):
         self.assertIs(augmented, catalog)
 
     def test_project_reference_can_span_an_escaped_ampersand_without_overlapping_syntax(self) -> None:
-        catalog = GlossaryCatalog().with_source_preserved_terms(
-            [r"Planets \& Dimensions"]
-        )
-        source = r"Read Planets \& Dimensions chapter."
+        for escape in (r"\&", "\\&\\"):
+            with self.subTest(escape=escape):
+                catalog = GlossaryCatalog().with_source_preserved_terms(
+                    [f"Planets {escape} Dimensions"]
+                )
+                source = f"Read Planets {escape} Dimensions chapter."
+                spans = catalog.replacement_spans_for_parts([source])[0]
+                protected = TokenProtector().protect(source, term_spans=spans)
 
-        spans = catalog.replacement_spans_for_parts([source])[0]
-        protected = TokenProtector().protect(source, term_spans=spans)
-
-        self.assertEqual(
-            [source[span.start : span.end] for span in spans],
-            ["Planets ", " Dimensions"],
-        )
-        self.assertNotIn("Planets", protected.protected)
-        self.assertNotIn("Dimensions", protected.protected)
-        self.assertEqual(protected.restore(protected.protected), source)
-        self.assertTrue(catalog.candidate_preserves_terms([source], [source]))
-        self.assertFalse(
-            catalog.candidate_preserves_terms(
-                [source],
-                [r"惑星 \& 次元のchapterを読む。"],
-            )
-        )
+                self.assertEqual(
+                    [source[span.start : span.end] for span in spans],
+                    ["Planets ", " Dimensions"],
+                )
+                self.assertIn(escape, protected.special_values)
+                self.assertNotIn("Planets", protected.protected)
+                self.assertNotIn("Dimensions", protected.protected)
+                self.assertEqual(protected.restore(protected.protected), source)
+                self.assertTrue(catalog.candidate_preserves_terms([source], [source]))
+                self.assertFalse(catalog.candidate_preserves_terms(
+                    [source], [f"惑星 {escape} 次元のchapterを読む。"],
+                ))
 
     def test_action_phrase_project_title_is_not_frozen_when_used_as_an_instruction(self) -> None:
         catalog = GlossaryCatalog().with_source_preserved_terms(

@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import json
 import re
+import unicodedata
 from collections import Counter, deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 from .categories import REFERENCE_NAME_CATEGORY_IDS, REFERENCE_PROSE_CATEGORY_IDS
 from .domain import CancelledError, TranslationError, TranslationOutcome, TranslationProject, TranslationUnit
 from .glossary import GlossaryCatalog, visible_terminology_text
+from .json_streams import FlatJsonStreamPlan
 from .openai_client import (
     FAST_MODE_SERVICE_TIER,
     OpenAIClient,
@@ -22,12 +24,15 @@ from .protection import (
     ProtectedText,
     TermReplacement,
     TokenProtector,
+    has_protected_possessive_suffix,
     looks_like_raw_json_text,
     protected_layout_signature,
     protected_syntax_ranges,
     should_translate,
+    without_leading_styled_article,
 )
 from .unicode_safety import translation_unicode_issue
+from .translation_quality import japanese_word_order_issue
 from .quota import ComplimentaryQuotaExhausted, QuotaStatus
 
 
@@ -49,6 +54,7 @@ _PROTECTION_RETRY_CONTEXT = (
 _WORD_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 _MQP_PLACEHOLDER = re.compile(r"__MQP_[0-9A-F]{4}__")
 _OMISSIBLE_ENGLISH_DETERMINERS = frozenset({"a", "an", "the"})
+_ENGLISH_LIST_CONNECTOR = re.compile(r" *,? *and *\Z", re.IGNORECASE)
 _DYNAMIC_COMPONENT_FIELDS = frozenset(
     {"translate", "score", "selector", "keybind", "nbt", "object"}
 )
@@ -83,6 +89,8 @@ class _StyledBodyProjection:
     source_text: str
     opening: str
     reset: str
+    source_start: int = -1
+    protected_body: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,15 +103,19 @@ class _ProjectionCandidate:
     opening: str = ""
     reset: str = ""
     local_suffix: bool = False
+    symbol_body: str = ""
+    body_source_start: int = -1
+    protected_body: str = ""
 
 
 @dataclass(frozen=True, slots=True)
 class _ProviderProjection:
     """Provider-facing text plus exact local-only token expansions.
 
-    A closed formatting span whose entire body is one protected term, or one
-    logical term split by formatting/escaped-ampersand syntax, is one semantic
-    unit for translation. Exposing its pieces as independent opaque tokens
+    A closed formatting span whose entire body consists of protected terms
+    and whitespace, or one logical term split by formatting/escaped-ampersand
+    syntax, is one semantic unit for translation. Exposing its pieces as
+    independent opaque tokens
     lets a model separate the term or put a Japanese particle inside its
     formatting range. Such spans are therefore projected to one otherwise-
     unused MQP token and expanded locally before the existing fail-closed
@@ -112,17 +124,20 @@ class _ProviderProjection:
     Consecutive non-reset formatting stacks at either safe edge are also kept
     local.  An absolute leading stack is restored through ``fixed_prefix``.
     A simple terminal styled suffix is translated as a separate child and
-    appended through ``local_suffix_bodies``.  The latter is deliberately not
-    represented by a movable provider token: moving an unclosed suffix before
+    appended through ``local_suffix_bodies``; a protected-name-only tail after
+    closed scopes is restored through ``fixed_suffix``. Neither is represented
+    by a movable provider token: moving an unclosed suffix before
     its preceding prose would make its formatting bleed into that prose.
     """
 
     text: str
     term_token_aliases: tuple[tuple[str, str], ...] = ()
     expansions: tuple[tuple[str, str], ...] = ()
+    symbol_bindings: tuple[tuple[str, str], ...] = ()
     styled_bodies: tuple[_StyledBodyProjection, ...] = ()
     local_suffix_bodies: tuple[_StyledBodyProjection, ...] = ()
     fixed_prefix: str = ""
+    fixed_suffix: str = ""
 
     def provider_token_for(self, original_token: str) -> str:
         for original, provider in self.term_token_aliases:
@@ -142,6 +157,7 @@ class _ProviderProjection:
             or self.styled_bodies
             or self.local_suffix_bodies
             or self.fixed_prefix
+            or self.fixed_suffix
         ) and observed_tokens != expected_tokens:
             missing = sorted((expected_tokens - observed_tokens).elements())
             extra = sorted((observed_tokens - expected_tokens).elements())
@@ -176,6 +192,7 @@ class _ProviderProjection:
             translated += (
                 styled.opening + translated_parts[styled.part_id] + styled.reset
             )
+        translated += self.fixed_suffix
         return translated
 
 
@@ -222,9 +239,11 @@ def _terminal_unclosed_styled_body_candidate(
 ) -> _ProjectionCandidate | None:
     """Return one simple terminal unclosed style as a local-only suffix.
 
-    Only one consecutive non-reset formatting stack followed by unprotected
-    ordinary text is eligible.  Newline/tab boundaries, later style switches,
-    terminology, and technical placeholders retain the strict provider path.
+    A consecutive non-reset formatting stack followed by ordinary text is
+    eligible, also after closed scopes. A protected-name-only tail following
+    closed scopes is kept as a fixed local expansion instead of a child.
+    Newline/tab boundaries, internal style switches, and mixed protected/
+    ordinary text retain the provider path.
     Keeping the suffix out of the parent provider item prevents a model from
     moving preceding prose into the unclosed formatting scope.
     """
@@ -232,13 +251,13 @@ def _terminal_unclosed_styled_body_candidate(
     if protected.structural_placeholders or len(protected.formatting_segments) != 1:
         return None
     formatting = protected.formatting_segments[0]
-    tokens = formatting.source_sequence
-    if (
-        not tokens
-        or formatting.movable_groups
+    tokens = formatting.trailing_placeholders or formatting.source_sequence
+    if not tokens:
+        return None
+    if not formatting.trailing_placeholders and (
+        formatting.movable_groups
         or not formatting.strict_segment_signatures
         or not formatting.strict_segment_signatures[0][0]
-        or not formatting.strict_segment_signatures[-1][0]
     ):
         return None
 
@@ -261,9 +280,27 @@ def _terminal_unclosed_styled_body_candidate(
         cursor += len(token)
 
     body = source[cursor:]
+    body_tokens = tuple(_MQP_PLACEHOLDER.findall(body))
+    visible_body = _MQP_PLACEHOLDER.sub("", body)
     if (
-        not any(character.isalnum() for character in body)
-        or _MQP_PLACEHOLDER.search(body)
+        body_tokens
+        and all(token in protected.term_placeholders for token in body_tokens)
+        and all(
+            character.isspace() or unicodedata.category(character)[0] in {"P", "S"}
+            for character in visible_body
+        )
+        and not has_protected_possessive_suffix(body, protected.term_placeholders)
+    ):
+        return _ProjectionCandidate(
+            start=start,
+            end=len(source),
+            fixed_expansion=source[start:],
+            local_suffix=True,
+        )
+    if (
+        (not any(character.isalnum() for character in visible_body)
+         and not has_protected_possessive_suffix(body, protected.term_placeholders))
+        or any(token not in protected.term_placeholders for token in body_tokens)
     ):
         return None
     opening = source[start:cursor]
@@ -284,14 +321,69 @@ def _terminal_unclosed_styled_body_candidate(
     if last_span is None:
         raise TranslationError("内部エラー: 末尾装飾本文の原文位置を特定できません")
     original_body = protected.original[last_span[1] :]
-    if original_body != body:
-        return None
     return _ProjectionCandidate(
         start=start,
         end=len(source),
         body_source=original_body,
+        body_source_start=last_span[1],
+        protected_body=body,
         opening=opening,
         local_suffix=True,
+    )
+
+
+def _fixed_unclosed_style_projection(
+    protected: ProtectedText, part_id: str,
+) -> _ProviderProjection | None:
+    """Split strict, reset-free colour changes into locally ordered bodies.
+
+    Unlike a closed span, these bodies cannot move with Japanese word order:
+    every later character inherits the preceding codes. Keep the initial
+    stack locally, translate the first body, and append the remaining styled
+    body as a child. Further switches are handled recursively by that child.
+    The complete original layout is still validated after assembly.
+    """
+    if protected.structural_placeholders or len(protected.formatting_segments) != 1:
+        return None
+    formatting = protected.formatting_segments[0]
+    tokens = formatting.source_sequence
+    if (len(tokens) < 2 or formatting.movable_groups
+            or not formatting.strict_segment_signatures
+            or any(protected.replacements[token].lower() in {"&r", "§r"}
+                   for token in tokens)):
+        return None
+
+    source = protected.protected
+    prefix_end = 0
+    index = 0
+    while index < len(tokens) and source.startswith(tokens[index], prefix_end):
+        prefix_end += len(tokens[index])
+        index += 1
+    if index == len(tokens):
+        return None  # One leading stack already has a simpler projection.
+    start = source.index(tokens[index])
+    if start <= prefix_end:
+        return None
+    body_start = start
+    while index < len(tokens) and source.startswith(tokens[index], body_start):
+        body_start += len(tokens[index])
+        index += 1
+    if body_start == len(source):
+        return None
+    spans = dict(zip(protected.special_placeholders, protected.special_source_spans, strict=True))
+    original_start = spans[tokens[index - 1]][1]
+    return _ProviderProjection(
+        text=source[prefix_end:start],
+        fixed_prefix=source[:prefix_end],
+        local_suffix_bodies=(_StyledBodyProjection(
+            part_id=f"{part_id}::styled::0000",
+            provider_token="",
+            source_text=protected.original[original_start:],
+            opening=source[start:body_start],
+            reset="",
+            source_start=original_start,
+            protected_body=source[body_start:],
+        ),),
     )
 
 
@@ -304,6 +396,10 @@ class _PreparedPart:
     unit_key: str
     source_path: str
     styled_parts: tuple[_PreparedPart, ...] = ()
+    raw_json_fragment: bool = False
+    parent_token_aliases: tuple[tuple[str, str], ...] = ()
+    json_stream_plan: FlatJsonStreamPlan | None = None
+    provider_context: str = ""
 
 
 @dataclass(slots=True)
@@ -313,10 +409,22 @@ class _PreparedUnit:
     path_by_part: dict[str, tuple[object, ...]]
     parts: list[_PreparedPart]
     glossary: GlossaryCatalog
+    json_stream_plan: FlatJsonStreamPlan | None = None
+    json_stream_part_id: str = ""
 
     def assemble(self, translated_parts: dict[str, str]) -> str:
         if self.template is None:
             return translated_parts[self.parts[0].id] if self.parts else self.unit.source
+        if self.json_stream_plan is not None:
+            rendered = self.json_stream_plan.render(
+                self.template,
+                translated_parts[self.json_stream_part_id],
+                {
+                    int(path[0]): translated_parts[part_id]
+                    for part_id, path in self.path_by_part.items()
+                },
+            )
+            return json.dumps(rendered, ensure_ascii=False, separators=(",", ":"))
         rendered = copy.deepcopy(self.template)
         for part_id, path in self.path_by_part.items():
             rendered = _set_path(rendered, path, translated_parts[part_id])
@@ -618,7 +726,12 @@ class TranslationService:
                     done += 1
                     report(f"既存翻訳を保持: {unit.key}")
                     continue
+                quality_issue = japanese_word_order_issue(
+                    unit.source, existing, project.source_locale, project.target_locale,
+                )
                 report(
+                    f"既存訳を再翻訳: {unit.key} / 理由: {quality_issue}"
+                    if quality_issue else
                     "既存訳の保護コード、JSON構造、またはUnicode安全性が"
                     f"不一致のため再翻訳: {unit.key}"
                 )
@@ -877,7 +990,7 @@ def _make_batches(
     current_chars = 0
     request_ids: set[str] = set()
     for root_part in pending:
-        bundle = (*root_part.styled_parts, root_part)
+        bundle = _bundle_parts(root_part)
         bundle_chars = 0
         for item in bundle:
             if item.id in request_ids:
@@ -887,7 +1000,8 @@ def _make_batches(
             # well, so include every child and the owning root in one budget.
             item_chars = len(
                 json.dumps(
-                    _provider_item(item),
+                    {key: value for key, value in _provider_item(item).items()
+                     if key != "_source_text"},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -958,7 +1072,7 @@ def _grouped_term_projection_candidates(
     eligible_specials = formatting_tokens | frozenset(
         placeholder
         for placeholder in protected.special_placeholders
-        if protected.replacements.get(placeholder) == r"\&"
+        if protected.replacements.get(placeholder) in {r"\&", "\\&\\"}
     )
     formatting_positions: dict[str, int] = {}
     formatting_at_start: dict[int, str] = {}
@@ -975,6 +1089,7 @@ def _grouped_term_projection_candidates(
     for segment in protected.formatting_segments:
         if segment.strict_segment_signatures:
             strict_formatting_tokens.update(segment.source_sequence)
+        strict_formatting_tokens.update(segment.trailing_placeholders)
         for formatting_group in segment.movable_groups:
             group_start = formatting_positions[formatting_group.placeholders[0]]
             group_end = (
@@ -1002,6 +1117,13 @@ def _grouped_term_projection_candidates(
             strict=True,
         )
         if segment.strict_segment_signatures
+    )
+    strict_layout_ranges.extend(
+        (formatting_positions[segment.trailing_placeholders[0]], layout_end)
+        for (_layout_start, layout_end), segment in zip(
+            layout_ranges, protected.formatting_segments, strict=True
+        )
+        if segment.trailing_placeholders
     )
 
     candidates: list[_ProjectionCandidate] = []
@@ -1103,15 +1225,17 @@ def _build_provider_projection(
 ) -> _ProviderProjection:
     """Keep eligible formatting boundaries under deterministic local control.
 
-    A scope containing exactly one protected term can be expanded locally as a
-    fixed value.  A scope containing only ordinary source text is represented
+    A scope containing only protected terms and whitespace can be expanded
+    locally as a fixed value, even when its names use different colours.
+    A simple scope containing only ordinary source text is represented
     by a child translation part; the translated child is inserted between the
     original opening codes and reset.  A simple unclosed style stack at the
     absolute beginning is removed from provider input and restored as an exact
     local prefix.  A simple unclosed suffix is translated independently and
     appended locally so its boundary cannot move.  Groups containing mixed
-    terms, technical placeholders, or other complex/unclosed formatting remain
-    under the existing fail-closed validator instead of being guessed at.
+    terms and ordinary text, technical placeholders, or compound styled prose
+    retain their internal boundary checks. Unclosed formatting remains under
+    the existing fixed-layout validator.
     """
 
     source = protected.protected
@@ -1131,7 +1255,20 @@ def _build_provider_projection(
             text=source[len(fixed_prefix) :],
             fixed_prefix=fixed_prefix,
         )
+    fixed_scopes = _fixed_unclosed_style_projection(protected, part_id)
+    if fixed_scopes is not None:
+        return fixed_scopes
     groups = _grouped_term_projection_candidates(protected)
+    if len(protected.formatting_segments) == 1:
+        tail = protected.formatting_segments[0].trailing_placeholders
+        suffix = "".join(tail)
+        if tail and source.endswith(suffix) and all(
+            protected.replacements[token].lower() in {"&r", "§r"} for token in tail
+        ):
+            groups.append(_ProjectionCandidate(
+                start=len(source) - len(suffix), end=len(source),
+                fixed_expansion=suffix, local_suffix=True,
+            ))
     terminal_suffix = _terminal_unclosed_styled_body_candidate(protected)
     if terminal_suffix is not None:
         groups.append(terminal_suffix)
@@ -1161,53 +1298,123 @@ def _build_provider_projection(
             observed_tokens = tuple(_MQP_PLACEHOLDER.findall(original_group))
             terms = tuple(token for token in observed_tokens if token in term_placeholders)
 
-            if len(terms) == 1:
-                term_token = terms[0]
-                expected_tokens = (
-                    *formatting_tokens[:-1],
-                    term_token,
-                    formatting_tokens[-1],
-                )
-                if (
-                    observed_tokens == expected_tokens
-                    and not _MQP_PLACEHOLDER.sub("", original_group).strip()
-                ):
-                    groups.append(
-                        _ProjectionCandidate(
-                            start=start,
-                            end=end,
-                            term_tokens=(term_token,),
-                            fixed_expansion=original_group,
-                        )
-                    )
+            body_tokens = tuple(token for token in observed_tokens if token not in formatting_tokens)
+            if (
+                len(body_tokens) == 1
+                and body_tokens[0] in protected.special_placeholders
+                and protected.replacements[body_tokens[0]].startswith("/")
+                and not _MQP_PLACEHOLDER.sub("", original_group).strip()
+            ):
+                # A literal command (including its protected arguments) and
+                # its complete style scope are one immutable semantic unit.
+                groups.append(_ProjectionCandidate(
+                    start=start, end=end, fixed_expansion=original_group,
+                    symbol_body=protected.replacements[body_tokens[0]],
+                ))
                 continue
 
-            # Plain styled prose is translated as a child node.  Any internal
-            # protected token makes the group ineligible for this simple path.
-            if terms or observed_tokens != formatting_tokens:
+            symbol_body = _MQP_PLACEHOLDER.sub("", original_group)
+            if (
+                observed_tokens == formatting_tokens
+                and symbol_body.strip()
+                and all(
+                    character.isspace()
+                    or unicodedata.category(character)[0] in {"P", "S"}
+                    for character in symbol_body
+                )
+            ):
+                # UI glyphs such as ``&a+&r`` have no linguistic body to
+                # translate. Keep the glyph and every style boundary in one
+                # immutable token while translating the surrounding sentence.
+                groups.append(
+                    _ProjectionCandidate(
+                        start=start,
+                        end=end,
+                        fixed_expansion=original_group,
+                        symbol_body=symbol_body,
+                    )
+                )
                 continue
-            last_opening = formatting_tokens[-2]
-            reset_token = formatting_tokens[-1]
-            body_start = positions[-2] + len(last_opening)
-            body_end = positions[-1]
+
+            if (
+                terms
+                and all(
+                    token in term_placeholders or token in formatting_tokens
+                    for token in observed_tokens
+                )
+                and all(
+                    character.isspace() or unicodedata.category(character)[0] in {"P", "S"}
+                    for character in _MQP_PLACEHOLDER.sub("", original_group)
+                )
+                and not has_protected_possessive_suffix(original_group, term_placeholders)
+            ):
+                # A reset-closed scope can contain several differently
+                # coloured names, e.g. ``&eMekanism &dFission Reactors&r``.
+                # Keep all of its original code/term positions together and
+                # expose the complete compound name as one semantic token.
+                groups.append(
+                    _ProjectionCandidate(
+                        start=start,
+                        end=end,
+                        term_tokens=terms,
+                        fixed_expansion=original_group,
+                    )
+                )
+                continue
+
+            # Translate mixed prose/names inside their original scope. Child
+            # tokens are mapped back to these exact parent occurrences after
+            # validation, never by replacing restored visible name strings.
+            if any(token not in term_placeholders and token not in formatting_tokens
+                   and protected.replacements.get(token) not in {r"\&", "\\&\\"}
+                   for token in observed_tokens):
+                continue
+            opening_index = 0
+            while (
+                opening_index + 1 < len(formatting_tokens) - 1
+                and positions[opening_index] + len(formatting_tokens[opening_index])
+                == positions[opening_index + 1]
+            ):
+                opening_index += 1
+            last_opening = formatting_tokens[opening_index]
+            closing_index = len(formatting_tokens) - 1
+            # A nested child does not carry its parent's colour contract. In
+            # ``&oSentence &cName&f!&r`` it would otherwise see ``&cName&f`` as
+            # a movable atom and could put prose into the parent's white ``!``
+            # slot. Keep symbol-only closing slots with the local closing
+            # codes, just as the opening stack is kept outside the child.
+            while closing_index - 1 > opening_index:
+                previous = closing_index - 1
+                closing_body = source[
+                    positions[previous] + len(formatting_tokens[previous])
+                    : positions[closing_index]
+                ]
+                if _MQP_PLACEHOLDER.search(closing_body) or any(
+                    character.isalnum() for character in closing_body
+                ):
+                    break
+                closing_index = previous
+            reset_token = formatting_tokens[closing_index]
+            body_start = positions[opening_index] + len(last_opening)
+            body_end = positions[closing_index]
             body = source[body_start:body_end]
-            if not any(character.isalnum() for character in body):
+            if not any(character.isalnum() for character in _MQP_PLACEHOLDER.sub("", body)) and not (
+                has_protected_possessive_suffix(body, term_placeholders)
+            ):
                 continue
             opening_span = special_spans.get(last_opening)
             reset_span = special_spans.get(reset_token)
             if opening_span is None or reset_span is None:
                 raise TranslationError("内部エラー: 装飾本文の原文位置を特定できません")
             original_body = protected.original[opening_span[1] : reset_span[0]]
-            if original_body != body:
-                raise TranslationError("内部エラー: 装飾本文を原文へ対応付けられません")
             opening = source[start:body_start]
             reset = source[body_end:end]
             if (
                 tuple(_MQP_PLACEHOLDER.findall(opening))
-                != formatting_tokens[:-1]
+                != formatting_tokens[:opening_index + 1]
                 or tuple(_MQP_PLACEHOLDER.findall(reset))
-                != (reset_token,)
-                or _MQP_PLACEHOLDER.sub("", opening + reset)
+                != formatting_tokens[closing_index:]
+                or _MQP_PLACEHOLDER.sub("", opening)
             ):
                 raise TranslationError("内部エラー: 装飾本文の境界を生成できません")
             groups.append(
@@ -1215,6 +1422,8 @@ def _build_provider_projection(
                     start=start,
                     end=end,
                     body_source=original_body,
+                    body_source_start=opening_span[1],
+                    protected_body=body,
                     opening=opening,
                     reset=reset,
                 )
@@ -1275,6 +1484,8 @@ def _build_provider_projection(
             source_text=group.body_source,
             opening=group.opening,
             reset=group.reset,
+            source_start=group.body_source_start,
+            protected_body=group.protected_body,
         )
         if group.local_suffix:
             local_suffix_bodies.append(styled)
@@ -1294,8 +1505,17 @@ def _build_provider_projection(
             for group, provider_token in projected_groups
             if provider_token and group.fixed_expansion
         ),
+        symbol_bindings=tuple(
+            (provider_token, group.symbol_body)
+            for group, provider_token in projected_groups
+            if provider_token and group.symbol_body
+        ),
         styled_bodies=tuple(styled_bodies),
         local_suffix_bodies=tuple(local_suffix_bodies),
+        fixed_suffix="".join(
+            group.fixed_expansion for group, _token in projected_groups
+            if group.local_suffix and group.fixed_expansion
+        ),
     )
 
 
@@ -1315,7 +1535,10 @@ def _provider_item(
     item: dict[str, Any] = {
         "id": part.id,
         "text": part.provider_projection.text,
-        "context": part.context if context is None else context,
+        "context": (part.context if context is None else context) + part.provider_context,
+        # Local-only evidence for binding a protected/nested child to its
+        # original scope. The API adapter does not serialize this field.
+        "_source_text": part.protected.original,
     }
     bindings: list[dict[str, str]] = []
     if not (
@@ -1337,6 +1560,10 @@ def _provider_item(
         ):
             raise TranslationError("内部エラー: 固有名詞の参照情報を生成できません")
         provider_token = part.provider_projection.provider_token_for(placeholder)
+        if provider_token not in part.provider_projection.text:
+            # Protected terminal names are restored locally and must not be
+            # advertised as tokens the provider can output or reposition.
+            continue
         fragments_by_provider_token.setdefault(provider_token, []).append(
             (placeholder, start, end)
         )
@@ -1379,6 +1606,10 @@ def _provider_item(
                 "approved_output": approved_output,
             }
         )
+    bindings.extend(
+        {"token": token, "source_term": symbol, "approved_output": symbol}
+        for token, symbol in part.provider_projection.symbol_bindings
+    )
     if bindings:
         item["term_bindings"] = bindings
     if part.provider_projection.styled_bodies:
@@ -1400,6 +1631,7 @@ def _restore_translated_part(
     target_locale: str,
     translated_parts: Mapping[str, str],
 ) -> str:
+    response = part.protected.remove_adjacent_term_echoes(response)
     provider_tokens = tuple(_MQP_PLACEHOLDER.findall(part.provider_projection.text))
     provider_replacements = dict.fromkeys(provider_tokens, "")
     source_requires_body = _text_requires_translated_body(
@@ -1407,15 +1639,29 @@ def _restore_translated_part(
         provider_replacements,
         _provider_content_placeholders(part),
         source_locale,
+        has_local_content=bool(part.provider_projection.local_suffix_bodies),
+    ) or has_protected_possessive_suffix(
+        part.provider_projection.text, part.protected.term_placeholders
     )
     response_has_body = _has_unprotected_meaningful_text(
         response,
         provider_replacements,
+    ) or has_protected_possessive_suffix(response, part.protected.term_placeholders)
+    connector_punctuation = part.raw_json_fragment and _raw_json_connector_is_safe(
+        part.protected.original,
+        response,
+        source_locale,
+        target_locale,
     )
-    if source_requires_body and not response_has_body:
+    if source_requires_body and not response_has_body and not connector_punctuation:
         raise TranslationError("OpenAI の応答から翻訳本文が失われました")
     response = part.provider_projection.expand(response, translated_parts)
-    restored = part.protected.restore(response)
+    response = part.protected.restore_source_term_spacing(response)
+    restored = part.protected.restore(
+        response, allow_omitted_determiners=_is_english_locale(source_locale),
+    )
+    if part.json_stream_plan is not None:
+        part.json_stream_plan.validate_skeleton(restored)
     unicode_issue = translation_unicode_issue(
         part.protected.protected,
         response,
@@ -1423,11 +1669,16 @@ def _restore_translated_part(
     )
     if unicode_issue is not None:
         raise TranslationError(unicode_issue)
+    if part.parent_token_aliases:
+        aliases = dict(part.parent_token_aliases)
+        return _MQP_PLACEHOLDER.sub(lambda match: aliases[match.group()], response)
     return restored
 
 
 def _bundle_parts(root: _PreparedPart) -> tuple[_PreparedPart, ...]:
-    return (*root.styled_parts, root)
+    return (*(
+        part for child in root.styled_parts for part in _bundle_parts(child)
+    ), root)
 
 
 def _part_for_item_id(
@@ -1472,6 +1723,12 @@ def _restore_bundle_response(
             return {}, (part, exc)
         local_parts[part.id] = restored
         restored_parts[part.id] = restored
+    if not root.raw_json_fragment and root.json_stream_plan is None:
+        quality_issue = japanese_word_order_issue(
+            root.protected.original, restored_parts[root.id], source_locale, target_locale,
+        )
+        if quality_issue:
+            return {}, (root, TranslationError(quality_issue))
     return restored_parts, None
 
 
@@ -1495,6 +1752,7 @@ def _provider_content_placeholders(part: _PreparedPart) -> tuple[str, ...]:
     content.extend(
         styled.provider_token for styled in part.provider_projection.styled_bodies
     )
+    content.extend(token for token, _symbol in part.provider_projection.symbol_bindings)
     return tuple(dict.fromkeys(content))
 
 
@@ -1503,12 +1761,14 @@ def _text_requires_translated_body(
     replacements: Mapping[str, str],
     content_placeholders: tuple[str, ...],
     source_locale: str,
+    *,
+    has_local_content: bool = False,
 ) -> bool:
     if not _has_unprotected_meaningful_text(text, replacements):
         return False
     if not _is_english_locale(source_locale):
         return True
-    if not content_placeholders:
+    if not content_placeholders and not has_local_content:
         return True
     visible = text
     for placeholder in replacements:
@@ -1528,6 +1788,29 @@ def _text_requires_translated_body(
 def _is_english_locale(locale: str) -> bool:
     normalized = locale.strip().lower().replace("-", "_")
     return normalized == "en" or normalized.startswith("en_")
+
+
+def _raw_json_connector_is_safe(
+    source: str,
+    candidate: str,
+    source_locale: str,
+    target_locale: str,
+) -> bool:
+    """Allow a Japanese list delimiter for one isolated English ``and`` leaf.
+
+    The caller must prove this is a raw JSON text fragment. A comma can join
+    the neighbouring styled list items without any alphanumeric characters;
+    empty output, ordinary prose, and disjunctions still require translated
+    text. This does not replace the normal syntax/Unicode validation.
+    """
+
+    target = target_locale.strip().lower().replace("-", "_")
+    return (
+        _is_english_locale(source_locale)
+        and (target == "ja" or target.startswith("ja_"))
+        and _ENGLISH_LIST_CONNECTOR.fullmatch(source) is not None
+        and candidate.strip(" \u3000") in {"、", "，"}
+    )
 
 
 def _has_unprotected_meaningful_text(text: str, replacements: Mapping[str, str]) -> bool:
@@ -1824,6 +2107,7 @@ def _make_prepared_part(
     unit_key: str,
     source_path: str,
     protector: TokenProtector,
+    raw_json_fragment: bool = False,
 ) -> _PreparedPart:
     projection = _build_provider_projection(protected, part_id)
     styled_parts: list[_PreparedPart] = []
@@ -1832,28 +2116,47 @@ def _make_prepared_part(
         *projection.local_suffix_bodies,
     )
     for index, styled in enumerate(projected_bodies, start=1):
-        body_protected = protector.protect(styled.source_text, term_spans=[])
-        if body_protected.protected != styled.source_text or body_protected.replacements:
-            raise TranslationError(
-                "内部エラー: 装飾本文に未分離の保護対象が含まれています"
+        body_end = styled.source_start + len(styled.source_text)
+        body_terms = [
+            TermReplacement(start - styled.source_start, end - styled.source_start,
+                            protected.replacements[token], group_id)
+            for token, (start, end), group_id in zip(
+                protected.term_placeholders, protected.term_source_spans,
+                protected.term_group_ids, strict=True,
             )
-        body_projection = _build_provider_projection(body_protected, styled.part_id)
-        if (
-            body_projection.styled_bodies
-            or body_projection.local_suffix_bodies
-            or body_projection.expansions
-        ):
-            raise TranslationError("内部エラー: 装飾本文の翻訳階層が入れ子になっています")
-        styled_parts.append(
-            _PreparedPart(
-                id=styled.part_id,
-                protected=body_protected,
-                provider_projection=body_projection,
-                context=f"{context}, styled text {index}",
-                unit_key=unit_key,
-                source_path=source_path,
-            )
+            if styled.source_start >= 0 and styled.source_start <= start < end <= body_end
+        ]
+        body_protected = protector.protect(styled.source_text, term_spans=body_terms)
+        aliases: tuple[tuple[str, str], ...] = ()
+        if styled.protected_body:
+            child_tokens = _MQP_PLACEHOLDER.findall(body_protected.protected)
+            parent_tokens = _MQP_PLACEHOLDER.findall(styled.protected_body)
+            if len(child_tokens) != len(parent_tokens):
+                raise TranslationError("内部エラー: 装飾本文の保護対象を親へ対応付けられません")
+            aliases = tuple(zip(child_tokens, parent_tokens, strict=True))
+            alias_map = dict(aliases)
+            if (
+                _MQP_PLACEHOLDER.sub(lambda match: alias_map[match.group()], body_protected.protected)
+                != styled.protected_body
+                or any(body_protected.replacements[child] != protected.replacements[parent]
+                       for child, parent in aliases)
+            ):
+                raise TranslationError("内部エラー: 装飾本文の保護対象が原文と一致しません")
+        elif body_protected.protected != styled.source_text or body_protected.replacements:
+            raise TranslationError("内部エラー: 装飾本文に未分離の保護対象が含まれています")
+        child = _make_prepared_part(
+            part_id=styled.part_id,
+            protected=body_protected,
+            context=f"{context}, styled text {index}",
+            unit_key=unit_key,
+            source_path=source_path,
+            protector=protector,
         )
+        styled_parts.append(_PreparedPart(
+            id=child.id, protected=child.protected, provider_projection=child.provider_projection,
+            context=child.context, unit_key=child.unit_key, source_path=child.source_path,
+            styled_parts=child.styled_parts, parent_token_aliases=aliases,
+        ))
     return _PreparedPart(
         id=part_id,
         protected=protected,
@@ -1862,6 +2165,7 @@ def _make_prepared_part(
         unit_key=unit_key,
         source_path=source_path,
         styled_parts=tuple(styled_parts),
+        raw_json_fragment=raw_json_fragment,
     )
 
 
@@ -1881,6 +2185,10 @@ def _prepare_unit(
             raise TranslationError(
                 f"raw JSON text を解析できないため安全に翻訳できません: {unit.key}"
             ) from exc
+        flat_stream = _flat_json_stream_plan(template, glossary)
+        if flat_stream is not None:
+            plan, terminology = flat_stream
+            return _prepare_flat_json_stream(unit, template, plan, terminology, protector, glossary)
         streams = _component_text_streams(template)
         paths = [path for stream in streams for path in stream]
         terminology_by_path: dict[tuple[object, ...], list[TermReplacement]] = {}
@@ -1909,6 +2217,7 @@ def _prepare_unit(
                     unit_key=unit.key,
                     source_path=unit.source_path,
                     protector=protector,
+                    raw_json_fragment=True,
                 )
             )
             path_by_part[part_id] = path
@@ -1933,6 +2242,137 @@ def _prepare_unit(
         protector=protector,
     )
     return _PreparedUnit(unit, None, {part.id: ()}, [part], glossary)
+
+
+def _flat_json_stream_plan(
+    template: Any, glossary: GlossaryCatalog,
+) -> tuple[FlatJsonStreamPlan, list[list[TermReplacement]]] | None:
+    plan = FlatJsonStreamPlan.create(template)
+    if plan is None:
+        return None
+    terminology = glossary.replacement_spans_for_parts(list(plan.source_texts))
+    # A name split across adjacent styled nodes is safe: both node text and
+    # component order stay fixed. A name spanning a freely translated string
+    # gap must instead retain the conservative per-leaf layout validation.
+    if any(
+        span.group_id is not None
+        for index, spans in enumerate(terminology)
+        if isinstance(template[index], str)
+        for span in spans
+    ):
+        return None
+    return plan, terminology
+
+
+def _prepare_flat_json_stream(
+    unit: TranslationUnit,
+    template: list[Any],
+    plan: FlatJsonStreamPlan,
+    terminology: list[list[TermReplacement]],
+    protector: TokenProtector,
+    glossary: GlossaryCatalog,
+) -> _PreparedUnit:
+    parts: list[_PreparedPart] = []
+    paths: dict[str, tuple[object, ...]] = {}
+    for index in plan.node_indices:
+        source = plan.source_texts[index]
+        if not should_translate(source):
+            continue
+        part_id = f"{unit.id}-p{index:03d}"
+        parts.append(_make_prepared_part(
+            part_id=part_id,
+            protected=protector.protect(source, term_spans=terminology[index]),
+            context=f"{unit.context or unit.key}, JSON styled component {index + 1}",
+            unit_key=unit.key, source_path=unit.source_path, protector=protector,
+        ))
+        paths[part_id] = (index, "text")
+    node_markers = plan.node_markers
+    skeleton_terms: list[TermReplacement] = []
+    offset = 0
+    for index, source in enumerate(plan.source_texts):
+        if index in node_markers:
+            offset += len(node_markers[index])
+            continue
+        skeleton_terms.extend(
+            TermReplacement(offset + span.start, offset + span.end, span.replacement)
+            for span in terminology[index]
+        )
+        offset += len(source)
+    protected = protector.protect(plan.skeleton, term_spans=skeleton_terms)
+    references = [
+        {
+            "token": token,
+            "source_text": "".join(
+                plan.source_texts[index]
+                for index in plan.node_groups[plan.markers.index(value)]
+            ),
+        }
+        for token, value in protected.replacements.items() if value in plan.markers
+    ]
+    root_id = f"{unit.id}-json-stream"
+    root = _make_prepared_part(
+        part_id=root_id, protected=protected,
+        context=f"{unit.context or unit.key}, JSON visible sentence",
+        unit_key=unit.key, source_path=unit.source_path, protector=protector,
+    )
+    parts.append(replace(
+        root, json_stream_plan=plan,
+        provider_context=(
+            ". "
+            "Component tokens keep their order and styling; translate the surrounding "
+            "sentence together. Adjacent component tokens without source prose between "
+            "them must remain adjacent. Component reference data: "
+            + json.dumps(references, ensure_ascii=False)
+        ),
+    ))
+    return _PreparedUnit(unit, template, paths, parts, glossary, plan, root_id)
+
+
+def _existing_flat_json_translation_is_safe(
+    template: list[Any], candidate: Any, plan: FlatJsonStreamPlan,
+    terminology: list[list[TermReplacement]], glossary: GlossaryCatalog,
+    source_locale: str, target_locale: str,
+) -> bool:
+    skeleton = plan.candidate_skeleton(template, candidate)
+    if skeleton is None:
+        return False
+    try:
+        plan.validate_skeleton(skeleton)
+    except TranslationError:
+        return False
+    if not (
+        _existing_text_syntax_is_compatible(plan.skeleton, skeleton, glossary, source_locale)
+        and _existing_text_unicode_is_compatible(plan.skeleton, skeleton, glossary, target_locale)
+        and glossary.candidate_preserves_term_layout(
+            list(plan.source_texts), plan.texts(candidate),
+        )
+    ):
+        return False
+    for index in plan.node_indices:
+        source = plan.source_texts[index]
+        translated = candidate[index]["text"]
+        if not should_translate(source):
+            if translated != source:
+                return False
+            continue
+        # Names split across nodes have occurrence-specific fragment protection;
+        # independently looking them up would incorrectly choose standalone
+        # glossary translations instead of preserving the original fragments.
+        protected = TokenProtector().protect(source, term_spans=terminology[index])
+        visible = translated
+        for value in protected.replacements.values():
+            # Each occurrence was checked by the stream-wide terminology
+            # layout validator. Remove only that occurrence, not incidental
+            # matching prose elsewhere in the same styled label.
+            visible = visible.replace(value, "", 1)
+        if (
+            protected_syntax_ranges(translated)
+            or (_source_requires_translated_body(protected, source_locale)
+                and not any(character.isalnum() for character in visible))
+            or not _existing_text_unicode_is_compatible(source, translated, glossary, target_locale)
+        ):
+            return False
+    return True
 
 
 def _component_text_streams(
@@ -2116,6 +2556,8 @@ def _existing_translation_is_safe(
     if treat_as_plain or not looks_like_raw_json_text(source):
         if not should_translate(source):
             return candidate == source
+        if japanese_word_order_issue(source, candidate, source_locale, target_locale):
+            return False
         return (
             _existing_text_syntax_is_compatible(
                 source,
@@ -2139,6 +2581,13 @@ def _existing_translation_is_safe(
         candidate_component = json.loads(candidate)
     except ValueError:
         return False
+    flat_stream = _flat_json_stream_plan(source_component, glossary or GlossaryCatalog())
+    if flat_stream is not None:
+        plan, terminology = flat_stream
+        return _existing_flat_json_translation_is_safe(
+            source_component, candidate_component, plan, terminology,
+            glossary or GlossaryCatalog(), source_locale, target_locale,
+        )
     source_streams = _component_text_streams(source_component)
     candidate_streams = _component_text_streams(candidate_component)
     if source_streams != candidate_streams:
@@ -2177,11 +2626,19 @@ def _existing_translation_is_safe(
         if not should_translate(source_text):
             if candidate_text != source_text:
                 return False
-        elif not _existing_text_syntax_is_compatible(
-            source_text,
-            candidate_text,
-            glossary,
-            source_locale,
+        elif not (
+            _existing_text_syntax_is_compatible(
+                source_text,
+                candidate_text,
+                glossary,
+                source_locale,
+            )
+            or _raw_json_connector_is_safe(
+                source_text,
+                candidate_text,
+                source_locale,
+                target_locale,
+            )
         ):
             return False
         elif not _existing_text_unicode_is_compatible(
@@ -2251,6 +2708,8 @@ def _without_omissible_source_determiners(
 ) -> str | None:
     if not _is_english_locale(source_locale):
         return None
+    original_source = source
+    source = without_leading_styled_article(source)
     term_spans = (
         glossary.replacement_spans_for_parts([source])[0]
         if glossary is not None
@@ -2258,23 +2717,39 @@ def _without_omissible_source_determiners(
     )
     protected = TokenProtector().protect(source, term_spans=term_spans)
     if not protected.content_placeholders:
-        return None
+        return source if source != original_source else None
     occupied = (*protected.special_source_spans, *protected.term_source_spans)
+    # Mask before tokenizing: in ``&5The Name&r``, scanning the raw string
+    # sees ``5The`` and would discard the article with the colour code.
+    visible = list(source)
+    for start, end in occupied:
+        visible[start:end] = " " * (end - start)
     words = [
         match
-        for match in _WORD_TOKEN.finditer(source)
-        if not any(
-            match.start() < end and match.end() > start
-            for start, end in occupied
-        )
+        for match in _WORD_TOKEN.finditer("".join(visible))
     ]
-    if not words or not all(
-        match.group(0).isascii()
-        and match.group(0).isalpha()
-        and match.group(0).casefold() in _OMISSIBLE_ENGLISH_DETERMINERS
-        for match in words
-    ):
-        return None
+    def is_determiner(match: re.Match[str]) -> bool:
+        return match.group(0).casefold() in _OMISSIBLE_ENGLISH_DETERMINERS
+
+    if not words:
+        return source if source != original_source else None
+    if not all(is_determiner(match) for match in words):
+        # A styled name inside a longer sentence can also lose its article.
+        # Never strip ordinary words or cross a colour/newline/technical
+        # boundary; a name must be present inside the same source slot.
+        eligible_words = []
+        cursor = 0
+        for start, end in (*protected.special_source_spans, (len(source), len(source))):
+            slot_words = [word for word in words if cursor <= word.start() < start]
+            if slot_words and all(is_determiner(word) for word in slot_words) and any(
+                cursor <= term_start < term_end <= start
+                for term_start, term_end in protected.term_source_spans
+            ):
+                eligible_words.extend(slot_words)
+            cursor = end
+        words = eligible_words
+        if not words:
+            return source if source != original_source else None
     chunks: list[str] = []
     cursor = 0
     for match in words:
@@ -2306,6 +2781,19 @@ def _assembled_translation_preserves_terms(
         candidate_component = json.loads(candidate)
     except ValueError:
         return False
+    flat_stream = _flat_json_stream_plan(source_component, glossary)
+    if flat_stream is not None:
+        plan, _terminology = flat_stream
+        skeleton = plan.candidate_skeleton(source_component, candidate_component)
+        if skeleton is None:
+            return False
+        try:
+            plan.validate_skeleton(skeleton)
+        except TranslationError:
+            return False
+        return glossary.candidate_preserves_term_layout(
+            list(plan.source_texts), plan.texts(candidate_component),
+        )
     source_streams = _component_text_streams(source_component)
     candidate_streams = _component_text_streams(candidate_component)
     if source_streams != candidate_streams:

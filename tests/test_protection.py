@@ -264,6 +264,244 @@ class TokenProtectorTests(unittest.TestCase):
             protected_layout_signature("§bB訳§rの前に§aA訳§rを置く"),
         )
 
+    def test_white_color_terminates_a_preceding_non_white_color_group(self) -> None:
+        for marker in ("&", "§"):
+            with self.subTest(marker=marker):
+                source = (
+                    f"The {marker}dGem Case{marker}f is used to store and upgrade "
+                    f"{marker}bGems{marker}r. "
+                )
+                protected = self.protector.protect(
+                    source,
+                    term_spans=(
+                        TermReplacement(6, 14, "Gem Case"),
+                        TermReplacement(48, 52, "Gems"),
+                    ),
+                )
+                formatting = protected.formatting_segments[0]
+                self.assertFalse(formatting.strict_segment_signatures)
+                self.assertEqual(len(formatting.movable_groups), 2)
+
+                formats = {
+                    value: placeholder
+                    for placeholder, value in protected.replacements.items()
+                    if value in {
+                        f"{marker}d",
+                        f"{marker}f",
+                        f"{marker}b",
+                        f"{marker}r",
+                    }
+                }
+                terms = {
+                    value: placeholder
+                    for placeholder, value in protected.replacements.items()
+                    if value in {"Gem Case", "Gems"}
+                }
+                translated = (
+                    formats[f"{marker}d"]
+                    + terms["Gem Case"]
+                    + formats[f"{marker}f"]
+                    + "は、"
+                    + formats[f"{marker}b"]
+                    + terms["Gems"]
+                    + formats[f"{marker}r"]
+                    + "の保管とアップグレードに使用されます。 "
+                )
+                candidate = (
+                    f"{marker}dGem Case{marker}fは、"
+                    f"{marker}bGems{marker}rの保管とアップグレード"
+                    "に使用されます。 "
+                )
+
+                self.assertEqual(protected.restore(translated), candidate)
+
+                def term_spans(text: str) -> tuple[TermReplacement, ...]:
+                    return tuple(
+                        TermReplacement(
+                            text.index(term),
+                            text.index(term) + len(term),
+                            term,
+                        )
+                        for term in ("Gem Case", "Gems")
+                    )
+
+                self.assertEqual(
+                    protected_layout_signature(source, term_spans=term_spans(source)),
+                    protected_layout_signature(
+                        candidate,
+                        term_spans=term_spans(candidate),
+                    ),
+                )
+
+    def test_white_color_at_group_start_remains_an_opening_code(self) -> None:
+        for marker in ("&", "§"):
+            with self.subTest(marker=marker):
+                protected = self.protector.protect(
+                    f"Use {marker}fWhite{marker}r text"
+                )
+                formatting = protected.formatting_segments[0]
+                self.assertFalse(formatting.strict_segment_signatures)
+                self.assertEqual(len(formatting.movable_groups), 1)
+                opening, reset = formatting.movable_groups[0].placeholders
+
+                self.assertEqual(
+                    protected.restore(opening + "白い文字" + reset + "を使う"),
+                    f"{marker}f白い文字{marker}rを使う",
+                )
+
+    def test_white_terminated_groups_keep_layout_signature_when_prose_moves(
+        self,
+    ) -> None:
+        for marker in ("&", "§"):
+            for codes in ("dfbr", "DFBR"):
+                with self.subTest(marker=marker, codes=codes):
+                    color, white, blue, reset = (marker + code for code in codes)
+                    source = f"The {color}Name{white} then {blue}Gems{reset} here"
+                    protected = self.protector.protect(source)
+                    translated = (
+                        protected.protected.removeprefix("The ")
+                        .replace(" then ", "")
+                        .replace(" here", " are used")
+                    )
+                    candidate = f"{color}Name{white}{blue}Gems{reset} are used"
+
+                    self.assertEqual(protected.restore(translated), candidate)
+                self.assertEqual(
+                    protected_layout_signature(source),
+                    protected_layout_signature(candidate),
+                )
+
+    def test_white_inside_a_scope_before_reset_is_not_treated_as_scope_close(self) -> None:
+        for marker in ("&", "§"):
+            with self.subTest(marker=marker):
+                source = (
+                    f"{marker}oEverything you can read is {marker}cString"
+                    f"{marker}f!{marker}r"
+                )
+                protected = self.protector.protect(source, {"String": "String"})
+                formatting = protected.formatting_segments[0]
+                self.assertFalse(formatting.strict_segment_signatures)
+                self.assertEqual(len(formatting.movable_groups), 1)
+                group = formatting.movable_groups[0]
+                string_token = next(
+                    token for token, value in protected.replacements.items()
+                    if value == "String"
+                )
+                self.assertEqual(
+                    tuple(protected.replacements[token] for token in group.placeholders),
+                    tuple(f"{marker}{code}" for code in "ocfr"),
+                )
+                candidate = (
+                    group.placeholders[0] + "読める内容は"
+                    + group.placeholders[1] + string_token
+                    + group.placeholders[2] + "!" + group.placeholders[3]
+                )
+                self.assertEqual(protected.restore(candidate), f"{marker}o読める内容は{marker}cString{marker}f!{marker}r")
+
+    def test_white_terminal_followed_by_a_color_inheriting_style_remains_strict(
+        self,
+    ) -> None:
+        for marker in ("&", "§"):
+            for codes in ("dflr", "DFLR"):
+                for gap in ("", " prose "):
+                    with self.subTest(marker=marker, codes=codes, gap=gap):
+                        color, white, bold, reset = (
+                            marker + code for code in codes
+                        )
+                        source = f"{color}Name{white}{gap}{bold}Bold{reset}"
+                        protected = self.protector.protect(source)
+                        formatting = protected.formatting_segments[0]
+
+                        self.assertTrue(formatting.strict_segment_signatures)
+                        self.assertEqual(formatting.movable_groups, ())
+                        self.assertEqual(
+                            protected.restore(protected.protected), source
+                        )
+
+    def test_white_terminal_after_a_color_inheriting_style_remains_strict(
+        self,
+    ) -> None:
+        for marker in ("&", "§"):
+            for codes in ("dflr", "DFLR"):
+                with self.subTest(marker=marker, codes=codes):
+                    color, white, bold, reset = (marker + code for code in codes)
+                    source = f"{bold}Bold{reset} and {color}Name{white}"
+                    protected = self.protector.protect(source)
+                    formatting = protected.formatting_segments[0]
+
+                    self.assertTrue(formatting.strict_segment_signatures)
+                    self.assertEqual(formatting.movable_groups, ())
+                    self.assertEqual(protected.restore(protected.protected), source)
+                    before, _, after = protected.protected.partition(" and ")
+                    with self.assertRaises(TranslationError):
+                        protected.restore(after + " and " + before)
+
+    def test_white_terminal_followed_by_explicit_color_stack_can_move(self) -> None:
+        for marker in ("&", "§"):
+            for upper in (False, True):
+                for stack_template in (
+                    "&l&b",
+                    "&#12AB34",
+                    "&l&#12AB34",
+                    "&x&1&2&A&B&3&4",
+                    "&l&x&1&2&A&B&3&4",
+                ):
+                    with self.subTest(
+                        marker=marker, upper=upper, stack=stack_template
+                    ):
+                        codes = "DFR" if upper else "dfr"
+                        color, white, reset = (marker + code for code in codes)
+                        stack = stack_template.replace("&", marker)
+                        if upper:
+                            stack = stack.upper()
+                        source = f"Before {color}Name{white}{stack}Gems{reset} after"
+                        protected = self.protector.protect(source)
+                        formatting = protected.formatting_segments[0]
+
+                        self.assertFalse(formatting.strict_segment_signatures)
+                        self.assertEqual(len(formatting.movable_groups), 2)
+                        first, second = formatting.movable_groups
+                        translated = (
+                            "".join(second.placeholders[:-1])
+                            + "Gems"
+                            + second.placeholders[-1]
+                            + " then "
+                            + first.placeholders[0]
+                            + "Name"
+                            + first.placeholders[-1]
+                            + " are used"
+                        )
+                        candidate = (
+                            f"{stack}Gems{reset} then {color}Name{white} are used"
+                        )
+
+                        self.assertEqual(protected.restore(translated), candidate)
+                        self.assertEqual(
+                            protected_layout_signature(source),
+                            protected_layout_signature(candidate),
+                        )
+
+    def test_white_terminated_groups_reject_terms_swapped_between_colors(self) -> None:
+        for marker in ("&", "§"):
+            for codes in ("dfbr", "DFBR"):
+                with self.subTest(marker=marker, codes=codes):
+                    color, white, blue, reset = (marker + code for code in codes)
+                    source = f"The {color}Name{white} then {blue}Gems{reset} here"
+                    protected = self.protector.protect(
+                        source, {"Name": "Name", "Gems": "Gems"}
+                    )
+                    name, gems = protected.term_placeholders
+                    translated = (
+                        protected.protected.replace(name, "__SWAP__")
+                        .replace(gems, name)
+                        .replace("__SWAP__", gems)
+                    )
+
+                    with self.assertRaisesRegex(
+                        TranslationError, "装飾コードで囲まれた"
+                    ):
+                        protected.restore(translated)
+
     def test_reported_elementalcraft_description_allows_styled_group_reorder(self) -> None:
         source = (
             "To do so you need an &5Infuser&r on top of a &3Container&r. "
@@ -355,6 +593,150 @@ class TokenProtectorTests(unittest.TestCase):
         for translated in invalid:
             with self.subTest(translated=translated), self.assertRaises(TranslationError):
                 protected.restore(translated)
+
+    def test_compound_formatting_scope_can_move_as_a_whole(self) -> None:
+        for marker in ("&", "§"):
+            for codes in ("edbr", "EDBR"):
+                with self.subTest(marker=marker, codes=codes):
+                    yellow, purple, blue, reset = (marker + code for code in codes)
+                    source = (
+                        f"Use {yellow}Mekanism {purple}Fission Reactors{reset} "
+                        f"with {blue}Coolant{reset}."
+                    )
+                    protected = self.protector.protect(
+                        source,
+                        {"Mekanism": "Mekanism", "Fission Reactors": "Fission Reactors"},
+                    )
+                    compound, _, coolant = protected.protected.removeprefix(
+                        "Use "
+                    ).removesuffix(".").partition(" with ")
+                    translated = coolant + "で" + compound + "を使う。"
+                    candidate = (
+                        f"{blue}Coolant{reset}で"
+                        f"{yellow}Mekanism {purple}Fission Reactors{reset}を使う。"
+                    )
+
+                    self.assertEqual(protected.restore(translated), candidate)
+
+                    def term_spans(text: str) -> tuple[TermReplacement, ...]:
+                        return tuple(
+                            TermReplacement(text.index(term), text.index(term) + len(term), term)
+                            for term in ("Mekanism", "Fission Reactors")
+                        )
+
+                    self.assertEqual(
+                        protected_layout_signature(source, term_spans=term_spans(source)),
+                        protected_layout_signature(candidate, term_spans=term_spans(candidate)),
+                    )
+
+    def test_compound_formatting_preserves_internal_order_terms_and_body(self) -> None:
+        for marker in ("&", "§"):
+            for codes in ("edr", "EDR"):
+                with self.subTest(marker=marker, codes=codes):
+                    yellow, purple, reset = (marker + code for code in codes)
+                    source = f"Use {yellow}Mekanism machine {purple}Fission Reactors{reset}."
+                    protected = self.protector.protect(
+                        source,
+                        {"Mekanism": "Mekanism", "Fission Reactors": "Fission Reactors"},
+                    )
+                    tokens = {value: token for token, value in protected.replacements.items()}
+                    invalid = {
+                        "color_order": (
+                            protected.protected.replace(tokens[yellow], "__SWAP__")
+                            .replace(tokens[purple], tokens[yellow])
+                            .replace("__SWAP__", tokens[purple])
+                        ),
+                        "term_color": (
+                            protected.protected.replace(tokens["Mekanism"], "", 1)
+                            .replace(tokens[purple], tokens[purple] + tokens["Mekanism"])
+                        ),
+                        "body_missing": protected.protected.replace(" machine ", " "),
+                    }
+
+                    for reason, translated in invalid.items():
+                        with self.subTest(reason=reason), self.assertRaises(TranslationError):
+                            protected.restore(translated)
+
+    def test_compound_formatting_groups_cannot_cross_newlines(self) -> None:
+        for separator in ("\n", r"\n"):
+            with self.subTest(separator=repr(separator)):
+                source = "&eMekanism &dFission Reactors&r" + separator + "&bCoolant&r"
+                protected = self.protector.protect(source)
+                newline = next(
+                    token for token, value in protected.replacements.items()
+                    if value == separator
+                )
+                compound, _, coolant = protected.protected.partition(newline)
+                with self.assertRaises(TranslationError):
+                    protected.restore(coolant + newline + compound)
+
+    def test_unclosed_compound_formatting_cannot_move_outer_prose(self) -> None:
+        for marker in ("&", "§"):
+            with self.subTest(marker=marker):
+                source = f"Use {marker}eMekanism {marker}dFission Reactors"
+                protected = self.protector.protect(source)
+                with self.assertRaises(TranslationError):
+                    protected.restore(protected.protected.removeprefix("Use ") + "を使う")
+
+    def test_white_boundary_with_initially_inherited_compound_color_stays_strict(
+        self,
+    ) -> None:
+        for marker in ("&", "§"):
+            for codes in ("dflar", "DFLAR"):
+                for inherited in ("Inherited ", "!", "Mekanism"):
+                    for white_first in (False, True):
+                        with self.subTest(
+                            marker=marker, codes=codes, inherited=inherited,
+                            white_first=white_first,
+                        ):
+                            purple, white, bold, green, reset = (
+                                marker + code for code in codes
+                            )
+                            white_group = f"{purple}Name{white}"
+                            compound = f"{bold}{inherited}{green}Explicit{reset}"
+                            source = (
+                                white_group + " and " + compound if white_first
+                                else compound + " and " + white_group
+                            )
+                            protected = self.protector.protect(
+                                source, {"Mekanism": "Mekanism"}
+                            )
+                            self.assertTrue(
+                                protected.formatting_segments[0].strict_segment_signatures
+                            )
+                            self.assertEqual(protected.restore(protected.protected), source)
+                            first, _, second = protected.protected.partition(" and ")
+                            with self.assertRaises(TranslationError):
+                                protected.restore(second + " and " + first)
+
+    def test_white_boundary_with_explicit_initial_compound_color_can_move(self) -> None:
+        for marker in ("&", "§"):
+            for codes in ("dflabr", "DFLABR"):
+                with self.subTest(marker=marker, codes=codes):
+                    purple, white, bold, green, blue, reset = (
+                        marker + code for code in codes
+                    )
+                    source = (
+                        f"Use {purple}Name{white} and "
+                        f"{bold}{green}Initial {blue}Explicit{reset}."
+                    )
+                    protected = self.protector.protect(source)
+                    white_group, _, compound = protected.protected.removeprefix(
+                        "Use "
+                    ).removesuffix(".").partition(" and ")
+                    candidate = (
+                        f"{bold}{green}Initial {blue}Explicit{reset}と"
+                        f"{purple}Name{white}を使う。"
+                    )
+
+                    self.assertEqual(
+                        protected.restore(compound + "と" + white_group + "を使う。"),
+                        candidate,
+                    )
+                    self.assertEqual(
+                        protected_layout_signature(source),
+                        protected_layout_signature(candidate),
+                    )
 
     def test_orphan_reset_unclosed_and_complex_formatting_remain_fixed(self) -> None:
         cases = (
