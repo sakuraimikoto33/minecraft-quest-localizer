@@ -281,7 +281,7 @@ class PartialTranslationTests(unittest.TestCase):
         self.assertEqual(outcome.completed, 1)
         self.assertEqual(set(self.adapter.writes[0][0]), {"0"})
 
-    def test_normal_error_never_offers_partial_write(self):
+    def test_normal_error_without_completed_results_never_offers_partial_write(self):
         def confirm(_):
             self.fail("Normal error must not offer partial save")
         with self.assertRaises(TranslationError):
@@ -325,7 +325,7 @@ class PartialTranslationTests(unittest.TestCase):
         self.assertEqual(outcome.completed, 0)
         self.assertEqual(self.adapter.writes, [])
 
-    def test_quota_during_safety_retry_must_not_offer_partial_save(self):
+    def test_quota_during_safety_retry_offers_only_previous_safe_results(self):
         class UnsafeThenExhausted:
             calls = 0
             def translate_batch(self, key, model, items, source, target, cancel=None):
@@ -333,9 +333,15 @@ class PartialTranslationTests(unittest.TestCase):
                 if self.calls > 1:
                     raise exhausted()
                 return {item["id"]: ("安全な訳" if item["id"] == "0" else "") for item in items}
-        with self.assertRaises(TranslationError):
-            self.run_job(UnsafeThenExhausted(), lambda _: self.fail("Unsafe reply is not a quota stop"))
-        self.assertEqual(self.adapter.writes, [])
+        states = []
+        def confirm(state):
+            states.append(state)
+            return True
+        outcome = self.run_job(UnsafeThenExhausted(), confirm)
+        self.assertEqual(outcome.stop_reason, "error")
+        self.assertIsNone(states[0].quota)
+        self.assertEqual(states[0].completed, 1)
+        self.assertEqual(self.adapter.writes, [({"0": "安全な訳"}, {"selected_unit_ids": frozenset({"0"})})])
 
 
 class PartialArrayAdapterTests(unittest.TestCase):

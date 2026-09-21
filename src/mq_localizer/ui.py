@@ -318,6 +318,17 @@ def _resourcepack_activation_required(project: TranslationProject) -> bool:
     )
 
 
+def _translation_completion_title(outcome: TranslationOutcome) -> str:
+    if not outcome.partial:
+        return "翻訳完了"
+    return "翻訳エラーによる途中終了" if outcome.stop_reason == "error" else "無料枠不足による途中終了"
+
+
+def _short_error_details(message: str) -> str:
+    shortened = "\n".join(message.splitlines()[:12])[:1000]
+    return shortened + ("\n…詳細はログを確認してください。" if shortened != message else "")
+
+
 def _format_translation_completion(
     outcome: TranslationOutcome,
     project: TranslationProject | None = None,
@@ -332,7 +343,11 @@ def _format_translation_completion(
             "\nMinecraftのリソースパック画面で生成したパックを有効化してください。"
             if outcome.written and project is not None and _resourcepack_activation_required(project) else ""
         )
-        return f"\n=== 無料枠不足による途中終了 ===\n{action}\n未完了: {outcome.total - outcome.completed}件{note}"
+        reason = (
+            f"\n停止理由: {_short_error_details(outcome.error_message)}"
+            if outcome.stop_reason == "error" else ""
+        )
+        return f"\n=== {_translation_completion_title(outcome)} ===\n{action}\n未完了: {outcome.total - outcome.completed}件{reason}{note}"
     output_line = (
         _project_output_line(project)
         if project is not None
@@ -381,12 +396,18 @@ def _translation_completion_dialog(
 
 def _partial_confirmation_text(state: PartialTranslationState) -> str:
     quota = state.quota
-    return (
+    reason = (
         "次のリクエストが無料枠内に収まらないため、送信せず停止しました。\n\n"
         f"モデル: {state.model}\n{GROUP_LABELS[quota.group]} / Usage Tier {quota.usage_tier}\n"
         f"実使用量: {quota.used_tokens:,} / {quota.daily_limit:,} tokens\n"
         f"予約・使用量不明: {quota.reserved_tokens:,} tokens\n"
         f"残り: {quota.remaining_tokens:,} / 次回最大: {state.required_max_tokens:,} tokens\n\n"
+        if quota is not None else
+        "翻訳途中でエラーが発生したため、処理を停止しました。\n"
+        "失敗した項目・未完成の配列は保存しません。\n\n"
+        f"モデル: {state.model}\n停止理由:\n{_short_error_details(state.error_message)}\n\n"
+    )
+    return reason + (
         f"安全に部分出力可能: {state.completed} / {state.total} 件\n"
         f"未完了: {state.total - state.completed} 件\n\n"
         "完成済みの翻訳だけを書き込みますか？"
@@ -395,7 +416,7 @@ def _partial_confirmation_text(state: PartialTranslationState) -> str:
 
 def _ask_partial_output(parent: tk.Tk, state: PartialTranslationState) -> bool:
     window = tk.Toplevel(parent)
-    window.title("無料トークン枠の残量不足")
+    window.title("無料トークン枠の残量不足" if state.quota is not None else "翻訳エラー・途中保存の確認")
     window.transient(parent)
     window.geometry(f"+{parent.winfo_rootx()}+{parent.winfo_rooty()}")
     approved = False
@@ -2269,11 +2290,11 @@ class MainWindow:
                         )
                     )
                     self.progress_var.set(outcome.completed / outcome.total * 100 if outcome.partial and outcome.total else 100)
-                    self.status_var.set("無料枠不足で途中終了しました" if outcome.partial else "翻訳が完了しました")
+                    self.status_var.set(_translation_completion_title(outcome) if outcome.partial else "翻訳が完了しました")
                     self._render_durable_log_event(
                         completion_notice,
                         "warning" if outcome.partial else "ok",
-                        section="無料枠不足による途中終了" if outcome.partial else "翻訳完了",
+                        section=_translation_completion_title(outcome),
                     )
                     if analysis.log_error:
                         self._report_session_log_error(analysis.log_error)
@@ -2286,7 +2307,7 @@ class MainWindow:
                         )
                         if outcome.partial:
                             dialog_kind = "warning"
-                            dialog_title = "無料枠不足による途中終了"
+                            dialog_title = _translation_completion_title(outcome)
                             dialog_message = _format_translation_completion(outcome, project).strip()
                         if dialog_kind == "warning":
                             messagebox.showwarning(dialog_title, dialog_message)
@@ -2732,7 +2753,7 @@ class MainWindow:
         notice = self._persist_worker_log(
             _format_translation_completion(outcome, project),
             level="WARNING" if outcome.partial else "SUCCESS",
-            section="無料枠不足による途中終了" if outcome.partial else "翻訳完了",
+            section=_translation_completion_title(outcome),
         )
         return _WorkerTranslationEvent(
             outcome=outcome,

@@ -54,7 +54,7 @@ class TranslationProject:
     existing: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     # Adapter-defined values (e.g. a locale array) that cannot be written in
-    # fragments. A quota stop may emit a group only when every member is ready.
+    # fragments. A partial stop may emit a group only when every member is ready.
     atomic_output_groups: tuple[tuple[str, ...], ...] = ()
 
 
@@ -70,6 +70,8 @@ class TranslationOutcome:
     preserved_unselected: int = 0
     partial: bool = False
     written: bool = True
+    stop_reason: str = ""
+    error_message: str = ""
 
     @property
     def completed(self) -> int:

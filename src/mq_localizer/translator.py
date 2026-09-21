@@ -19,6 +19,7 @@ from .openai_client import (
     FAST_MODE_SERVICE_TIER,
     OpenAIClient,
     OpenAIResponseProtocolError,
+    _redact_sensitive,
 )
 from .protection import (
     ProtectedText,
@@ -76,10 +77,11 @@ class TranslationOptions:
 @dataclass(frozen=True, slots=True)
 class PartialTranslationState:
     model: str
-    quota: QuotaStatus
+    quota: QuotaStatus | None
     required_max_tokens: int
     total: int
     completed: int
+    error_message: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +497,7 @@ class TranslationService:
             report(f"OpenAI で翻訳中 ({batch_index}/{batch_index + len(batches)})")
             batch_parts = [part for root in batch for part in _bundle_parts(root)]
             request_items = [_provider_item(part) for part in batch_parts]
+            restored_root_ids: set[str] = set()
             try:
                 response = self._translate_batch(
                     api_key,
@@ -549,8 +552,20 @@ class TranslationService:
                             "この処理では翻訳ファイルへ書き込んでいません。"
                         ) from retry_error
                     response.update(individual)
+                    # Do not lose verified individual retries if a later
+                    # request fails before the full batch has returned.
+                    restored, failure = _restore_bundle_response(
+                        root, individual, source_locale, target_locale, translated_parts,
+                    )
+                    if failure is None:
+                        translated_parts.update(restored)
+                        restored_root_ids.add(root.id)
+                        if on_restored:
+                            on_restored(restored)
 
             for root in batch:
+                if root.id in restored_root_ids:
+                    continue
                 restored, failure = _restore_bundle_response(
                     root,
                     response,
@@ -763,7 +778,6 @@ class TranslationService:
         copied_ids = set(resolved) - reused_ids
         translated_parts: dict[str, str] = {}
         prepared_by_part = {part.id: prepared for prepared in prepared_units for part in prepared.parts}
-        unsafe_assemblies: set[str] = set()
 
         def complete_units(restored: dict[str, str]) -> None:
             nonlocal done, translated_count
@@ -778,51 +792,16 @@ class TranslationService:
                     prepared.unit.source, assembled, prepared.glossary,
                     treat_as_plain=prepared.unit.id in terminology_spans,
                 ):
-                    unsafe_assemblies.add(prepared.unit.id)
                     continue  # Preserve the existing assembly retry below.
                 resolved[prepared.unit.id] = assembled
                 translated_count += 1
                 done += 1
                 report(f"翻訳済み: {prepared.unit.key}")
 
-        quota_error: ComplimentaryQuotaExhausted | None = None
-        try:
-            self._translate_bundles(
-                pending, api_key, model, project.source_locale, project.target_locale,
-                options, report, cancel, translated_parts, complete_units,
-            )
-        except ComplimentaryQuotaExhausted as exc:
-            if unsafe_assemblies:
-                raise TranslationError(
-                    "組み立てた翻訳の固有名詞確認に失敗し、無料枠も不足しました。"
-                    "翻訳ファイルには書き込んでいません。"
-                ) from exc
-            quota_error = exc
-            selected_set = {unit.id for unit in selected_units}
-            # Locale arrays and visible component/title groups are atomic for
-            # partial output. Iterate to closure because groups can overlap.
-            required_groups = [
-                selected_set.intersection(group)
-                for group in (*terminology_groups, *reference_term_groups)
-            ]
-            required_groups.extend(set(group) for group in project.atomic_output_groups)
-            changed = True
-            while changed:
-                changed = False
-                for required in required_groups:
-                    if not required.issubset(resolved):
-                        for unit_id in required.intersection(resolved):
-                            del resolved[unit_id]
-                            changed = True
-            reused_count = len(reused_ids.intersection(resolved))
-            copied_count = len(copied_ids.intersection(resolved))
-            translated_count = len(resolved) - reused_count - copied_count
-            done = len(resolved)
-            prepared_units = []
-
-        for prepared in prepared_units:
+        def finish_pending_unit(prepared: _PreparedUnit) -> None:
+            nonlocal translated_count, done
             if prepared.unit.id in resolved:
-                continue
+                return
             assembled = prepared.assemble(translated_parts)
             if not _assembled_translation_preserves_terms(
                 prepared.unit.source,
@@ -907,42 +886,98 @@ class TranslationService:
             done += 1
             report(f"翻訳済み: {prepared.unit.key}")
 
+        stop_error: TranslationError | None = None
+        try:
+            self._translate_bundles(
+                pending, api_key, model, project.source_locale, project.target_locale,
+                options, report, cancel, translated_parts, complete_units,
+            )
+            for prepared in prepared_units:
+                finish_pending_unit(prepared)
+        except TranslationError as exc:
+            # Only the translation phase is recoverable. Cancellation,
+            # preparation, input/output guards and writer failures remain
+            # outside this catch and must never trigger a partial write.
+            stop_error = exc
+
         selected_ids = frozenset(unit.id for unit in selected_units)
-        if quota_error is None and set(resolved) != selected_ids:
+        if stop_error is None and set(resolved) != selected_ids:
             raise TranslationError("内部エラー: 選択したすべての翻訳単位が解決されていません")
 
-        unsafe_group = _first_unsafe_terminology_group(
-            project,
-            resolved,
-            glossary,
-            terminology_groups,
-            project_reference_glossary,
-        )
-        if unsafe_group is not None:
+        def exclude_incomplete_groups() -> None:
+            required_groups = [
+                selected_ids.intersection(group)
+                for group in (*terminology_groups, *reference_term_groups)
+            ]
+            required_groups.extend(set(group) for group in project.atomic_output_groups)
+            changed = True
+            while changed:
+                changed = False
+                for required in required_groups:
+                    if not required.issubset(resolved):
+                        for unit_id in required.intersection(resolved):
+                            del resolved[unit_id]
+                            changed = True
+
+        if stop_error is not None:
+            exclude_incomplete_groups()
+        while (unsafe_group := _first_unsafe_terminology_group(
+            project, resolved, glossary, terminology_groups, project_reference_glossary,
+        )) is not None:
             keys = ", ".join(
                 next(unit.key for unit in project.units if unit.id == unit_id)
                 for unit_id in unsafe_group
             )
-            raise TranslationError(
+            group_error = TranslationError(
                 "組み立て後にraw JSONコンポーネントをまたぐMod名または公式用語の"
                 "綴り・表示境界が変わりました。\n"
                 f"対象キー: {keys}\n"
                 "この処理では翻訳ファイルへ書き込んでいません。"
             )
+            unsafe_ids = set(unsafe_group).intersection(resolved)
+            if not unsafe_ids:
+                raise group_error  # Source fallback itself could not be verified.
+            # A cross-unit failure invalidates the entire affected group, not
+            # other independently completed translations.
+            stop_error = stop_error or group_error
+            report(f"部分出力から除外: {keys} / 理由: グループ全体の固有名詞確認に失敗しました")
+            for unit_id in unsafe_ids:
+                del resolved[unit_id]
+            exclude_incomplete_groups()
 
         if cancel and cancel.is_set():
             raise CancelledError("処理をキャンセルしました")
-        if quota_error is not None:
+        stop_reason = ""
+        error_message = ""
+        if stop_error is not None:
+            reused_count = len(reused_ids.intersection(resolved))
+            copied_count = len(copied_ids.intersection(resolved))
+            translated_count = len(resolved) - reused_count - copied_count
+            done = len(resolved)
+            quota_error = stop_error if isinstance(stop_error, ComplimentaryQuotaExhausted) else None
+            stop_reason = "quota" if quota_error is not None else "error"
+            error_message = _redact_sensitive(str(stop_error), api_key)
+            for boilerplate in (
+                "この処理では翻訳ファイルへ書き込んでいません。",
+                "翻訳ファイルには書き込んでいません。",
+            ):
+                error_message = error_message.replace(boilerplate, "")
+            error_message = error_message.strip()
             state = PartialTranslationState(
-                model, quota_error.status, quota_error.required_max_tokens, total, len(resolved)
+                model, quota_error.status if quota_error else None,
+                quota_error.required_max_tokens if quota_error else 0,
+                total, len(resolved), error_message,
             )
-            report(str(quota_error))
+            report(error_message)
+            if quota_error is None and (not resolved or confirm_partial is None):
+                raise stop_error
             if not resolved or confirm_partial is None or not confirm_partial(state):
-                report("無料枠不足で終了しました。翻訳ファイルには書き込んでいません")
+                report("途中終了しました。翻訳ファイルには書き込んでいません")
                 return TranslationOutcome(
                     output_path, total, translated_count, reused_count, copied_count,
                     len(glossary.entries), skipped_by_selection=skipped_by_selection,
                     partial=True, written=False,
+                    stop_reason=stop_reason, error_message=error_message,
                 )
         report("出力を検証して書き込んでいます")
         if pre_write_guard:
@@ -954,7 +989,7 @@ class TranslationService:
             adapter.write(project, resolved, output_path, selected_unit_ids=emitted_ids)
         else:
             adapter.write(project, resolved, output_path)
-        report("部分出力が完了しました" if quota_error is not None else "完了")
+        report("部分出力が完了しました" if stop_error is not None else "完了")
         return TranslationOutcome(
             output_path=output_path,
             total=total,
@@ -964,7 +999,8 @@ class TranslationService:
             glossary_terms=len(glossary.entries),
             skipped_by_selection=skipped_by_selection,
             preserved_unselected=0,
-            partial=quota_error is not None,
+            partial=stop_error is not None,
+            stop_reason=stop_reason, error_message=error_message,
         )
 
 
