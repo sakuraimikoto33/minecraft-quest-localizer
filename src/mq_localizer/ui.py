@@ -41,7 +41,7 @@ from .openai_client import (
     OpenAIClient,
     OpenAIRetryEvent,
     is_official_api_base_url,
-    is_safe_model_id,
+    is_translation_model_supported,
     normalize_api_base_url,
 )
 from .output_guard import (
@@ -962,16 +962,23 @@ def _model_candidates(settings: AppSettings) -> list[str]:
         ) == normalize_api_base_url(api_base_url)
     except ValueError:
         cache_matches_endpoint = False
+    official_endpoint = is_official_api_base_url(api_base_url)
 
     candidates = [
         model.strip()
         for model in (settings.cached_models if cache_matches_endpoint else ())
-        if is_safe_model_id(model)
+        if is_translation_model_supported(
+            model,
+            official_endpoint=official_endpoint,
+        )
     ]
     selected = settings.model.strip()
     if (
         cache_matches_endpoint
-        and is_safe_model_id(selected)
+        and is_translation_model_supported(
+            selected,
+            official_endpoint=official_endpoint,
+        )
         and selected not in candidates
     ):
         candidates.insert(0, selected)
@@ -1658,10 +1665,13 @@ class MainWindow:
             )
             self._open_settings("openai")
             return
-        if not is_safe_model_id(self.settings.model.strip()):
+        if not is_translation_model_supported(
+            self.settings.model.strip(),
+            official_endpoint=official_endpoint,
+        ):
             messagebox.showwarning(
                 "OpenAI設定",
-                "使用するモデルIDを設定してください。",
+                "Responses APIとStructured Outputsによる翻訳に対応したモデルを設定してください。",
             )
             self._open_settings("openai")
             return
@@ -4042,7 +4052,10 @@ class SettingsDialog:
             dict.fromkeys(
                 model.id.strip()
                 for model in models
-                if is_safe_model_id(model.id.strip())
+                if is_translation_model_supported(
+                    model.id.strip(),
+                    official_endpoint=is_official_api_base_url(current_api_base_url),
+                )
             )
         )[:MAX_CACHED_MODEL_COUNT]
         if not loaded_models:
@@ -4282,19 +4295,22 @@ class SettingsDialog:
                 parent=self.window,
             )
             return
-        if model and not is_safe_model_id(model):
-            self._select_tab("openai")
-            messagebox.showwarning(
-                "モデル",
-                "有効なモデルIDを入力してください。",
-                parent=self.window,
-            )
-            return
         if official_endpoint and model and model not in self.models:
             self._select_tab("openai")
             messagebox.showwarning(
                 "モデル",
                 "保存済みまたは取得済みのモデル一覧から選択してください。",
+                parent=self.window,
+            )
+            return
+        if model and not is_translation_model_supported(
+            model,
+            official_endpoint=official_endpoint,
+        ):
+            self._select_tab("openai")
+            messagebox.showwarning(
+                "モデル",
+                "Responses APIとStructured Outputsによる翻訳に対応したモデルを入力してください。",
                 parent=self.window,
             )
             return

@@ -33,6 +33,7 @@ from mq_localizer.openai_client import (  # noqa: E402
     UrllibJsonTransport,
     is_official_api_base_url,
     is_safe_model_id,
+    is_translation_model_supported,
     normalize_api_base_url,
 )
 from mq_localizer.protection import TokenProtector  # noqa: E402
@@ -376,6 +377,49 @@ class CompatibleAPIEndpointTests(unittest.TestCase):
 
 
 class OpenAIModelTests(unittest.TestCase):
+    def test_translation_model_support_rejects_non_text_and_explicit_capability_negatives(self) -> None:
+        self.assertFalse(is_translation_model_supported("text-embedding-3-small"))
+        self.assertFalse(is_translation_model_supported("gpt-4o-realtime-preview"))
+        self.assertFalse(
+            is_translation_model_supported("gpt-3.5-turbo", official_endpoint=True)
+        )
+        self.assertFalse(
+            is_translation_model_supported("gpt-4-turbo", official_endpoint=True)
+        )
+        self.assertTrue(is_translation_model_supported("gpt-4o-mini", official_endpoint=True))
+        self.assertFalse(
+            is_translation_model_supported(
+                "provider/translator",
+                metadata={"capabilities": {"supports_structured_outputs": False}},
+            )
+        )
+        self.assertTrue(is_translation_model_supported("provider/translator"))
+
+    def test_models_with_explicit_unsupported_endpoints_are_not_displayed(self) -> None:
+        transport = SequenceTransport(
+            {
+                "data": [
+                    {
+                        "id": "provider/chat-only",
+                        "created": 20,
+                        "supported_endpoints": ["/v1/chat/completions"],
+                    },
+                    {
+                        "id": "provider/responses-translator",
+                        "created": 10,
+                        "supported_endpoints": ["/v1/responses"],
+                    },
+                ]
+            }
+        )
+
+        models = OpenAIClient(
+            transport=transport,
+            base_url="https://compatible.example/v1",
+        ).list_models("")
+
+        self.assertEqual([model.id for model in models], ["provider/responses-translator"])
+
     def test_debug_hook_records_full_models_request_and_response_with_secrets_masked(
         self,
     ) -> None:
@@ -891,7 +935,6 @@ class OpenAIModelTests(unittest.TestCase):
             [model.id for model in models],
             [
                 "llama-3.3",
-                "embedding-but-provider-says-it-translates",
                 "vendor/translator:latest",
             ],
         )

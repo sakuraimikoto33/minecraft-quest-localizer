@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import Event
 from typing import Any, Callable, Protocol
@@ -363,6 +364,123 @@ def is_safe_model_id(value: object) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+# The translator always sends a Responses API request with a strict JSON
+# schema.  The Models API does not consistently expose capability metadata,
+# so these families are rejected by name as a conservative, provider-neutral
+# fallback.  This is deliberately limited to models whose primary purpose is
+# unambiguously not text translation; unknown compatible-provider IDs remain
+# selectable because only that provider can describe their capabilities.
+_NON_TRANSLATION_MODEL_MARKERS = (
+    "embedding",
+    "moderation",
+    "whisper",
+    "tts",
+    "text-to-speech",
+    "speech",
+    "dall-e",
+    "image",
+    "audio",
+    "realtime",
+    "transcrib",
+    "search",
+)
+_OFFICIAL_STRUCTURED_OUTPUT_UNSUPPORTED_PREFIXES = (
+    "gpt-3.5",
+    "gpt-4-",
+    "gpt-4.0",
+    "gpt-4.5-preview",
+    "chatgpt-4-",
+    "chatgpt-4.0",
+)
+_OFFICIAL_STRUCTURED_OUTPUT_UNSUPPORTED_IDS = frozenset(
+    {
+        "gpt-4",
+        "chatgpt-4",
+        # These snapshots predate the Structured Outputs-capable releases.
+        "gpt-4o-2024-05-13",
+        "gpt-4o-mini-2024-07-18",
+    }
+)
+
+
+def _capability_value(metadata: Mapping[str, Any], *names: str) -> bool | None:
+    """Return an explicit capability flag when a provider supplies one."""
+
+    lowered_names = {name.lower() for name in names}
+    for key, value in metadata.items():
+        if str(key).lower() in lowered_names and isinstance(value, bool):
+            return value
+    return None
+
+
+def _metadata_supports_translation(metadata: Mapping[str, Any]) -> bool:
+    """Check optional model capability metadata without requiring it.
+
+    OpenAI's standard model objects currently expose identity fields only,
+    while several compatible APIs include ``capabilities`` or endpoint lists.
+    An explicit negative declaration must win; an absent declaration is not
+    treated as a failure so custom providers remain usable.
+    """
+
+    for container in (metadata, metadata.get("capabilities")):
+        if not isinstance(container, Mapping):
+            continue
+        for names in (
+            ("supports_responses", "responses", "responses_api"),
+            ("supports_structured_outputs", "structured_outputs", "structured_output"),
+        ):
+            value = _capability_value(container, *names)
+            if value is False:
+                return False
+
+    for key in ("supported_endpoints", "endpoints", "api_endpoints"):
+        endpoints = metadata.get(key)
+        if not isinstance(endpoints, (list, tuple, set, frozenset)):
+            continue
+        normalized = {str(endpoint).lower().rstrip("/") for endpoint in endpoints}
+        if normalized and not any(
+            endpoint == "responses"
+            or endpoint.endswith("/responses")
+            or endpoint == "responses_api"
+            for endpoint in normalized
+        ):
+            return False
+    return True
+
+
+def is_translation_model_supported(
+    value: object,
+    *,
+    official_endpoint: bool = False,
+    metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether a model can be used by the translation service.
+
+    Translation requires the Responses API and strict Structured Outputs.
+    Official model IDs are additionally restricted to the text-capable GPT/O
+    families; compatible endpoints may use arbitrary provider IDs, but known
+    non-text families and explicit capability negatives are always rejected.
+    """
+
+    if not is_safe_model_id(value):
+        return False
+    model_id = value.lower()
+    if any(marker in model_id for marker in _NON_TRANSLATION_MODEL_MARKERS):
+        return False
+    if metadata is not None and not _metadata_supports_translation(metadata):
+        return False
+    if official_endpoint:
+        normalized_id = model_id.removeprefix("ft:")
+        if normalized_id in _OFFICIAL_STRUCTURED_OUTPUT_UNSUPPORTED_IDS:
+            return False
+        if any(
+            normalized_id.startswith(prefix)
+            for prefix in _OFFICIAL_STRUCTURED_OUTPUT_UNSUPPORTED_PREFIXES
+        ):
+            return False
+    return not official_endpoint or _is_text_model(model_id)
 
 
 def _is_http_header_safe(value: object) -> bool:
@@ -1205,7 +1323,11 @@ class OpenAIClient:
             if not isinstance(item, dict) or not is_safe_model_id(item.get("id")):
                 continue
             model_id = item["id"]
-            if self.is_official_endpoint and not _is_text_model(model_id):
+            if not is_translation_model_supported(
+                model_id,
+                official_endpoint=self.is_official_endpoint,
+                metadata=item,
+            ):
                 continue
             created = item.get("created", 0)
             if type(created) is not int:
@@ -1243,8 +1365,18 @@ class OpenAIClient:
         if not isinstance(model, str) or not model.isprintable():
             raise TranslationError("安全に使用できるモデルIDを指定してください")
         normalized_model = model.strip()
-        if not is_safe_model_id(normalized_model):
-            raise TranslationError("安全に使用できるモデルIDを指定してください")
+        if not is_translation_model_supported(
+            normalized_model,
+            # The UI performs the provider-specific allow-list check before a
+            # real translation starts.  Keep the client permissive for safe,
+            # unknown IDs so embedders and test transports can use their own
+            # aliases; unambiguously non-translation families are still
+            # rejected by the shared predicate.
+            official_endpoint=False,
+        ):
+            raise TranslationError(
+                "Responses APIとStructured Outputsによる翻訳に対応したモデルIDを指定してください"
+            )
         self.validate_quota_configuration(normalized_model, service_tier)
         structured_items = _prepare_structured_translation_items(items)
         schema = _structured_translation_schema(structured_items)
@@ -1676,19 +1808,7 @@ def _run_transport_request(
 
 def _is_text_model(model_id: str) -> bool:
     lowered = model_id.lower()
-    denied = (
-        "embedding",
-        "moderation",
-        "whisper",
-        "tts",
-        "dall-e",
-        "image",
-        "audio",
-        "realtime",
-        "transcrib",
-        "search",
-    )
-    if any(part in lowered for part in denied):
+    if any(part in lowered for part in _NON_TRANSLATION_MODEL_MARKERS):
         return False
     return (
         lowered.startswith(("gpt-", "chatgpt-", "ft:gpt-"))
