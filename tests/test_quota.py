@@ -89,12 +89,12 @@ class LedgerTests(unittest.TestCase):
         store.save(AppSettings(free_tokens_only=True, usage_tier=3, fast_mode=True))
         settings = store.load()
         self.assertTrue(settings.free_tokens_only)
-        self.assertEqual(settings.usage_tier, 3)
+        self.assertEqual(settings.usage_tier, "Launch")
         self.assertFalse(settings.fast_mode)
         store.path.write_text('{"free_tokens_only":"yes","usage_tier":true}', encoding="utf-8")
         settings = store.load()
         self.assertFalse(settings.free_tokens_only)
-        self.assertEqual(settings.usage_tier, 1)
+        self.assertEqual(settings.usage_tier, "Build")
 
 
 def response(text="翻訳", status="completed", usage=True):

@@ -41,22 +41,62 @@ _GROUP_MODELS = {
 }
 MODEL_GROUPS = {model: group for group, models in _GROUP_MODELS.items() for model in models}
 GROUP_LABELS = {"1m": "1Mトークングループ", "10m": "10Mトークングループ"}
+USAGE_TIERS = ("Free", "Build", "Launch", "Grow")
+USAGE_TIER_QUALIFICATIONS = {
+    "Free": "対象地域で利用可能",
+    "Build": "累計 $5 のクレジット購入",
+    "Launch": "累計 $100 のクレジット購入",
+    "Grow": "累計 $500 のクレジット購入",
+}
+
+_LEGACY_USAGE_TIER_MAP = {
+    1: "Build",
+    2: "Build",
+    3: "Launch",
+    4: "Launch",
+    5: "Grow",
+}
+
+
+def normalize_usage_tier(tier: object) -> str:
+    """Normalize current names and migrate the former numeric tier values."""
+
+    if type(tier) is int:
+        try:
+            return _LEGACY_USAGE_TIER_MAP[tier]
+        except KeyError as exc:
+            raise ValueError("Usage TierはFree / Build / Launch / Growから選択してください") from exc
+    if isinstance(tier, str):
+        normalized = tier.strip().casefold()
+        for name in USAGE_TIERS:
+            if name.casefold() == normalized:
+                return name
+    raise ValueError("Usage TierはFree / Build / Launch / Growから選択してください")
+
+
+def usage_tier_qualification(tier: str | int) -> str:
+    return USAGE_TIER_QUALIFICATIONS[normalize_usage_tier(tier)]
 
 
 def group_for_model(model: str) -> str | None:
     return MODEL_GROUPS.get(model.strip())
 
 
-def limits_for_usage_tier(tier: int) -> dict[str, int]:
-    if type(tier) is not int or not 1 <= tier <= 5:
-        raise ValueError("Usage Tierは1～5を選択してください")
-    return {"1m": 250_000, "10m": 2_500_000} if tier <= 2 else {"1m": 1_000_000, "10m": 10_000_000}
+def limits_for_usage_tier(tier: str | int) -> dict[str, int]:
+    current_tier = normalize_usage_tier(tier)
+    # Keep the lower historical allowance for Free and Build. Launch and Grow
+    # use the higher allowance that previously applied from Usage Tier 3 onward.
+    return (
+        {"1m": 250_000, "10m": 2_500_000}
+        if current_tier in {"Free", "Build"}
+        else {"1m": 1_000_000, "10m": 10_000_000}
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class QuotaStatus:
     group: str
-    usage_tier: int
+    usage_tier: str
     daily_limit: int
     used_tokens: int
     reserved_tokens: int
@@ -155,18 +195,19 @@ class QuotaLedger:
         atomic_write_text(self.path, json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     @staticmethod
-    def _status(data: dict, group: str, tier: int) -> QuotaStatus:
-        return QuotaStatus(group, tier, limits_for_usage_tier(tier)[group],
+    def _status(data: dict, group: str, tier: str | int) -> QuotaStatus:
+        current_tier = normalize_usage_tier(tier)
+        return QuotaStatus(group, current_tier, limits_for_usage_tier(current_tier)[group],
                            data["groups"][group]["used_tokens"],
                            sum(r["tokens"] for r in data["reservations"].values() if r["group"] == group),
                            data["utc_date"])
 
-    def statuses(self, tier: int) -> dict[str, QuotaStatus]:
+    def statuses(self, tier: str | int) -> dict[str, QuotaStatus]:
         limits_for_usage_tier(tier)
         with self._locked() as data:
             return {g: self._status(data, g, tier) for g in GROUP_LABELS}
 
-    def reserve(self, group: str, tier: int, tokens: int) -> str:
+    def reserve(self, group: str, tier: str | int, tokens: int) -> str:
         if not _token_count(tokens) or tokens == 0:
             raise ValueError("Invalid reservation size")
         with self._locked() as data:

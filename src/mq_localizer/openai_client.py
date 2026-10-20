@@ -1297,7 +1297,7 @@ class OpenAIClient:
         on_debug: Callable[[str], None] | None = None,
         quota_ledger: QuotaLedger | None = None,
         free_tokens_only: bool = False,
-        usage_tier: int = 1,
+        usage_tier: str | int = "Build",
     ) -> None:
         self.transport = transport or UrllibJsonTransport()
         self.base_url = normalize_api_base_url(base_url)

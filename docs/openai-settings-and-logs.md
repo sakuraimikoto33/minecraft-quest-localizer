@@ -35,9 +35,18 @@ OpenAI公式APIで有効にした場合、翻訳用Responses POSTリクエスト
 
 ## 無料トークン枠の保護
 
-「無料トークン枠を超えるリクエストを送信しない」を有効にすると、OpenAI公式APIのResponses APIだけで送信前判定を行います。モデルをHelp Centerの無料トークングループ（1M / 10M）へ分類し、設定したUsage Tier（1〜5）から日次上限を決めます。Tier 1〜2は1Mが250,000、10Mが2,500,000 tokens、Tier 3〜5はそれぞれ1,000,000、10,000,000 tokensです。無料枠はモデルごとではなくグループで共有され、UTC 00:00（日本時間09:00）にリセットされます。
+OpenAI公式のUsage Tierは現在 `Free` / `Build` / `Launch` / `Grow` です。区分ごとの利用条件は次の通りです。
 
-この機能はOpenAIの無料枠への参加資格を確認・変更しません。Organization/Projectで入力・出力のデータ共有と無料枠への登録が有効であること、正しいUsage Tierと残量を使用者が確認してください。無料枠の対象外モデル、互換API、fine-tune・tool useなどは開始前に停止します。Fast Modeとは併用できません。
+| 区分 | 利用条件 |
+| --- | --- |
+| Free | 対象地域で利用可能 |
+| Build | 累計 $5 のクレジット購入 |
+| Launch | 累計 $100 のクレジット購入 |
+| Grow | 累計 $500 のクレジット購入 |
+
+「無料トークン枠を超えるリクエストを送信しない」を有効にすると、OpenAI公式APIのResponses APIだけで日次共有トークン枠の送信前判定を行います。モデルを1M / 10Mトークングループへ分類します。ローカル上限はFree / Buildを低い枠（1Mが250,000、10Mが2,500,000 tokens/日）、Launch / Growを高い枠（1Mが1,000,000、10Mが10,000,000 tokens/日）として見積もります。Freeは低い枠を使う保守的な設定です。日次共有トークンの提供資格は対象地域、組織・プロジェクトのデータ共有設定、OpenAI側の適用状況に依存します。このアプリは資格や実残量を取得しないため、設定画面とUsage Dashboardで確認してください。日次枠はUTC 00:00（日本時間09:00）にリセットされます。
+
+このアプリはアカウントの利用状況や実残量を取得せず、設定された利用区分とアプリ自身が記録した日次tokensで送信前判定を行います。別アプリ・別PC・導入前の消費は含まれません。無料枠の対象外モデル、互換API、fine-tune・tool useなどは開始前に停止します。Fast Modeとは併用できません。
 
 送信前に同じInstructions、Input、Structured Outputs定義を `/responses/input_tokens` へ送り、入力token数を取得します。そこへ動的な `max_output_tokens` を加えた最大値を、`%APPDATA%\MinecraftQuestLocalizer\openai-usage.json`（他OSでは設定フォルダー）へ予約してから翻訳POSTを実行します。完了応答の `usage.total_tokens` が検証できた場合だけ予約を実使用量へ置き換えます。timeout、キャンセル、通信エラー、使用量欠落では、実際に消費していないと証明できないため予約を保持し、翻訳POSTを自動再送しません。
 
@@ -96,6 +105,7 @@ APIキー、Authorization、既知の資格情報fieldはマスクします。�
 
 ## OpenAI参考資料
 
+- [Usage tiers and rate limits](https://developers.openai.com/api/docs/guides/rate-limits)
 - [Models API](https://developers.openai.com/api/reference/cli/resources/models/methods/list)
 - [Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
 - [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)

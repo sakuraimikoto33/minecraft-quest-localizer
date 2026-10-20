@@ -50,7 +50,15 @@ from .output_guard import (
     assert_source_unchanged,
     snapshot_path,
 )
-from .quota import GROUP_LABELS, QuotaLedger, group_for_model, limits_for_usage_tier
+from .quota import (
+    GROUP_LABELS,
+    QuotaLedger,
+    USAGE_TIERS,
+    group_for_model,
+    limits_for_usage_tier,
+    normalize_usage_tier,
+    usage_tier_qualification,
+)
 from .scan_limits import (
     LANGUAGE_FILE_MIB_MAX,
     LANGUAGE_FILE_MIB_MIN,
@@ -3080,7 +3088,7 @@ class SettingsDialog:
         self.model_var = tk.StringVar(value=settings.model)
         self.fast_mode_var = tk.BooleanVar(value=settings.fast_mode)
         self.free_tokens_only_var = tk.BooleanVar(value=settings.free_tokens_only)
-        self.usage_tier_var = tk.IntVar(value=settings.usage_tier)
+        self.usage_tier_var = tk.StringVar(value=settings.usage_tier)
         self.quota_status_var = tk.StringVar()
         self.debug_logging_var = tk.BooleanVar(value=settings.debug_logging)
         self.batch_var = tk.IntVar(value=settings.batch_size)
@@ -3352,12 +3360,15 @@ class SettingsDialog:
 
     def _refresh_quota_status(self) -> None:
         try:
-            tier = int(self.usage_tier_var.get())
+            tier = normalize_usage_tier(self.usage_tier_var.get())
             limits_for_usage_tier(tier)
             official = is_official_api_base_url(normalize_api_base_url(self.api_base_url_var.get()))
             group = group_for_model(self.model_var.get()) if official else None
             statuses = QuotaLedger(self.store.path.parent / "openai-usage.json").statuses(tier)
-            lines = [f"現在のモデル: {GROUP_LABELS[group]}" if group else "無料トークン枠の対象モデルではありません"]
+            lines = [
+                f"利用区分: {tier}（{usage_tier_qualification(tier)}）",
+                f"現在のモデル: {GROUP_LABELS[group]}" if group else "無料トークン枠の対象モデルではありません",
+            ]
             for key, status in statuses.items():
                 lines.append(
                     f"{GROUP_LABELS[key]}{' ← 使用中' if key == group else ''}\n"
@@ -3789,16 +3800,22 @@ class SettingsDialog:
         self.free_tokens_only_check.grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(quota_box, text="Usage Tier").grid(row=1, column=0, sticky="w", pady=6)
         self.usage_tier_combo = ttk.Combobox(
-            quota_box, textvariable=self.usage_tier_var, values=(1, 2, 3, 4, 5), state="readonly", width=5
+            quota_box,
+            textvariable=self.usage_tier_var,
+            values=USAGE_TIERS,
+            state="readonly",
+            width=10,
         )
         self.usage_tier_combo.grid(row=1, column=1, sticky="w")
         ttk.Button(quota_box, text="使用量表示を更新", command=self._refresh_quota_status).grid(row=1, column=2, padx=10)
         ttk.Label(quota_box, textvariable=self.quota_status_var, justify="left", wraplength=650).grid(row=2, column=0, columnspan=3, sticky="w")
         ttk.Label(
             quota_box,
-            text=("公式API専用。無料枠対象のOrganization・プロジェクトでデータ共有が有効か、"
-                  "Tierが正しいかを事前に確認してください。共有設定は変更しません。\n"
-                  "別アプリ・別PC・導入前の消費は集計できず、課金ゼロは保証できません。"
+            text=("利用区分の条件: Free=対象地域、Build=累計 $5 購入、"
+                  "Launch=累計 $100 購入、Grow=累計 $500 購入。\n"
+                  "このアプリが送信前に確認するのは日次の共有トークン枠です。"
+                  "実際の共有対象・上限・残量はOpenAIのデータ共有設定とUsage Dashboardで確認してください。\n"
+                  "共有設定は変更しません。別アプリ・別PC・導入前の消費は集計できず、課金ゼロは保証できません。"
                   "Fast Modeとは併用できません。通信失敗時は最大使用量を予約したまま停止します。"),
             foreground="#9a3412", justify="left", wraplength=650,
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -4320,7 +4337,9 @@ class SettingsDialog:
             timeout = int(self.timeout_var.get())
             max_retries = int(self.retry_var.get())
             translation_prompt = self.prompt_text.get("1.0", "end-1c").strip()
-            usage_tier = int(value("usage_tier_var", self.settings.usage_tier))
+            usage_tier = normalize_usage_tier(
+                value("usage_tier_var", self.settings.usage_tier)
+            )
             limits_for_usage_tier(usage_tier)
             free_tokens_only = bool(value("free_tokens_only_var", self.settings.free_tokens_only))
             if free_tokens_only and not official_endpoint:
