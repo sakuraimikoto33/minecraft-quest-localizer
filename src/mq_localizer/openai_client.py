@@ -699,10 +699,15 @@ class UrllibJsonTransport:
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with _open_api_request(request, timeout) as response:
-                self.last_response_headers = {
-                    str(key).casefold(): str(value)
-                    for key, value in response.headers.items()
-                }
+                response_headers = getattr(response, "headers", None)
+                self.last_response_headers = (
+                    {
+                        str(key).casefold(): str(value)
+                        for key, value in response_headers.items()
+                    }
+                    if isinstance(response_headers, Mapping)
+                    else {}
+                )
                 response_bytes = _read_limited_response(response, _MAX_API_RESPONSE_BYTES)
                 try:
                     response_data = response_bytes.decode("utf-8")

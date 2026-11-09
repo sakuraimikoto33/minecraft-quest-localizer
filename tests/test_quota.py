@@ -169,14 +169,21 @@ class ClientQuotaTests(LedgerTests):
 
     def test_rejects_unknown_custom_priority_before_network(self):
         for model, kwargs, client_kwargs in (
-            ("gpt-6-astra", {}, {}),
+            ("gpt-6.9-unknown", {}, {}),
             ("gpt-5.6-sol", {"service_tier": "priority"}, {}),
             ("gpt-5.6-sol", {}, {"base_url": "https://example.com/v1"}),
         ):
-            transport = Transport()
+            transport = (
+                Transport({"input_tokens": 100})
+                if model == "gpt-6.9-unknown"
+                else Transport()
+            )
             with self.assertRaises(TranslationError):
                 self.call(self.client(transport, **client_kwargs), model, **kwargs)
-            self.assertEqual(transport.calls, [])
+            self.assertEqual(
+                [call[0] for call in transport.calls],
+                ["input_tokens"] if model == "gpt-6.9-unknown" else [],
+            )
 
     def test_invalid_count_no_generation_or_reservation(self):
         for value in (True, -1, "100", None):
