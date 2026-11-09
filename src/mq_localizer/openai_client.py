@@ -21,7 +21,12 @@ from typing import Any, Callable, Protocol
 
 from .domain import CancelledError, TranslationError
 from .protection import protected_syntax_signature
-from .quota import QuotaLedger, group_for_model, limits_for_usage_tier
+from .quota import (
+    QuotaLedger,
+    group_for_model,
+    limits_for_usage_tier,
+    resolve_model_group,
+)
 from .unicode_safety import JAPANESE_UNICODE_INSTRUCTIONS, is_japanese_locale
 from .translation_quality import (
     IMAGE_TITLE_RETRY_INSTRUCTIONS,
@@ -679,6 +684,9 @@ def _open_api_request(
 
 
 class UrllibJsonTransport:
+    def __init__(self) -> None:
+        self.last_response_headers: dict[str, str] = {}
+
     def request(
         self,
         method: str,
@@ -691,6 +699,10 @@ class UrllibJsonTransport:
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with _open_api_request(request, timeout) as response:
+                self.last_response_headers = {
+                    str(key).casefold(): str(value)
+                    for key, value in response.headers.items()
+                }
                 response_bytes = _read_limited_response(response, _MAX_API_RESPONSE_BYTES)
                 try:
                     response_data = response_bytes.decode("utf-8")
@@ -1308,6 +1320,7 @@ class OpenAIClient:
         self.on_debug = on_debug
         self.quota_ledger = quota_ledger
         self.free_tokens_only = free_tokens_only
+        self._last_response_headers: dict[str, str] = {}
         limits_for_usage_tier(usage_tier)
         self.usage_tier = usage_tier
         stripped_prompt = translation_prompt.strip()
@@ -1450,6 +1463,19 @@ class OpenAIClient:
             input_tokens = counted.get("input_tokens")
             if type(input_tokens) is not int or input_tokens < 0:
                 raise TranslationError("入力トークン数を確認できないため翻訳リクエストを送信しません")
+            if group is None:
+                group = resolve_model_group(
+                    normalized_model,
+                    headers=getattr(self, "_last_response_headers", {}),
+                    tier=self.usage_tier,
+                )
+                if group is None:
+                    raise TranslationError(
+                        "新しいモデルの無料トークングループをAPI応答から確認できません。"
+                        "Responses APIのレート制限ヘッダーを確認できないため、"
+                        "課金防止のため翻訳を送信しません。モデル一覧を再取得するか、"
+                        "無料枠保護を無効にしてください。"
+                    )
             maximum = _translation_output_budget(normalized_model, payload)
             payload["max_output_tokens"] = maximum
             payload["service_tier"] = "default"
@@ -1463,9 +1489,14 @@ class OpenAIClient:
         if self.quota_ledger is not None and group is not None:
             usage = _response_usage_tokens(body)
             returned_model = body.get("model")
+            returned_group = (
+                group_for_model(str(returned_model))
+                if returned_model is not None
+                else group
+            )
             if self.free_tokens_only and (
                 usage is None
-                or (returned_model is not None and group_for_model(str(returned_model)) != group)
+                or (returned_group is not None and returned_group != group)
             ):
                 raise TranslationError(
                     "OpenAIの使用量またはモデルグループを確認できません。"
@@ -1499,8 +1530,6 @@ class OpenAIClient:
             return
         if not self.is_official_endpoint:
             raise TranslationError("無料枠保護はOpenAI公式APIでのみ使用できます")
-        if group_for_model(model) is None:
-            raise TranslationError("無料トークン枠の対象モデルではありません")
         if service_tier is not None:
             raise TranslationError("無料枠保護とFast Modeは併用できません")
         if self.quota_ledger is None:
@@ -1552,6 +1581,7 @@ class OpenAIClient:
                 payload=payload,
             )
             try:
+                self._last_response_headers = {}
                 response = _run_transport_request(
                     self.transport,
                     method,
@@ -1561,6 +1591,12 @@ class OpenAIClient:
                     self.timeout,
                     cancel,
                 )
+                transport_headers = getattr(self.transport, "last_response_headers", {})
+                if isinstance(transport_headers, Mapping):
+                    self._last_response_headers = {
+                        str(key).casefold(): str(value)
+                        for key, value in transport_headers.items()
+                    }
                 self._emit_debug(
                     "RESPONSE",
                     method,

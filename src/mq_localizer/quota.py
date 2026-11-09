@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import contextmanager
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,32 +20,32 @@ from .domain import TranslationError
 from .io_utils import atomic_write_text
 
 
-# Explicit allowlist, reviewed 2026-09-18 against help.openai.com/en/articles/10306912.
-# Never infer eligibility for new dates, fine tunes, pro/search or provider aliases.
+# Explicit allowlist for the current data-sharing complimentary-token offer.
+# These are exact public model IDs; do not infer eligibility for aliases,
+# fine-tunes, provider prefixes, tools, or newly released snapshots.
 _GROUP_MODELS = {
     "1m": (
-        "gpt-5.6-sol", "gpt-5.6", "gpt-5.5", "gpt-5.5-2026-04-23",
-        "gpt-5.4", "gpt-5.4-2026-03-05", "gpt-5.2", "gpt-5.2-2025-12-11",
-        "gpt-5.1", "gpt-5.1-2025-11-13", "gpt-5.1-codex", "gpt-5-codex",
-        "gpt-5", "gpt-5-2025-08-07", "gpt-5-chat-latest",
-        "gpt-4.1", "gpt-4.1-2025-04-14", "gpt-4o", "gpt-4o-2024-05-13",
-        "gpt-4o-2024-08-06", "gpt-4o-2024-11-20", "o3", "o3-2025-04-16",
-        "o1", "o1-2024-12-17", "o1-preview", "o1-preview-2024-09-12",
+        "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+        "gpt-5.6-sol", "gpt-5.5-2026-04-23", "gpt-5.4-2026-03-05",
+        "gpt-5.2-2025-12-11", "gpt-5.1-2025-11-13", "gpt-5.1-codex",
+        "gpt-5-codex", "gpt-5-2025-08-07", "gpt-5-chat-latest",
+        "gpt-4.1-2025-04-14", "gpt-4o-2024-05-13", "gpt-4o-2024-08-06",
+        "gpt-4o-2024-11-20", "o3-2025-04-16", "o1-preview-2024-09-12",
+        "o1-2024-12-17",
     ),
     "10m": (
-        "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.4-mini-2026-03-17",
-        "gpt-5.4-nano", "gpt-5.4-nano-2026-03-17", "gpt-5.1-codex-mini",
-        "gpt-5-mini", "gpt-5-mini-2025-08-07", "gpt-5-nano", "gpt-5-nano-2025-08-07",
-        "gpt-4.1-mini", "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano", "gpt-4.1-nano-2025-04-14",
-        "gpt-4o-mini", "gpt-4o-mini-2024-07-18", "o4-mini", "o4-mini-2025-04-16",
-        "o1-mini", "o1-mini-2024-09-12", "codex-mini-latest",
+        "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini-2026-03-17",
+        "gpt-5.4-nano-2026-03-17", "gpt-5.1-codex-mini",
+        "gpt-5-mini-2025-08-07", "gpt-5-nano-2025-08-07",
+        "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano-2025-04-14",
+        "gpt-4o-mini-2024-07-18", "o4-mini-2025-04-16",
+        "o1-mini-2024-09-12", "codex-mini-latest",
     ),
 }
 MODEL_GROUPS = {model: group for group, models in _GROUP_MODELS.items() for model in models}
 GROUP_LABELS = {"1m": "1Mトークングループ", "10m": "10Mトークングループ"}
-USAGE_TIERS = ("Free", "Build", "Launch", "Grow")
+USAGE_TIERS = ("Build", "Launch", "Grow")
 USAGE_TIER_QUALIFICATIONS = {
-    "Free": "対象地域で利用可能",
     "Build": "累計 $5 のクレジット購入",
     "Launch": "累計 $100 のクレジット購入",
     "Grow": "累計 $500 のクレジット購入",
@@ -57,6 +59,18 @@ _LEGACY_USAGE_TIER_MAP = {
     5: "Grow",
 }
 
+# The Models API does not expose complimentary-token group metadata. The
+# Responses preflight does expose the model's token rate-limit header, whose
+# standard values identify the shared model group for each paid tier. Keep the
+# mapping narrow so an unknown/custom limit fails closed instead of being
+# treated as free by accident.
+_TOKEN_RATE_LIMIT_GROUPS = {
+    "Build": {1_000_000: "1m", 2_000_000: "10m"},
+    "Launch": {4_000_000: "1m", 10_000_000: "10m"},
+    "Grow": {40_000_000: "1m", 180_000_000: "10m"},
+}
+_POSITIVE_INTEGER_PATTERN = re.compile(r"^[0-9]+$")
+
 
 def normalize_usage_tier(tier: object) -> str:
     """Normalize current names and migrate the former numeric tier values."""
@@ -65,13 +79,13 @@ def normalize_usage_tier(tier: object) -> str:
         try:
             return _LEGACY_USAGE_TIER_MAP[tier]
         except KeyError as exc:
-            raise ValueError("Usage TierはFree / Build / Launch / Growから選択してください") from exc
+            raise ValueError("Usage TierはBuild / Launch / Growから選択してください") from exc
     if isinstance(tier, str):
         normalized = tier.strip().casefold()
         for name in USAGE_TIERS:
             if name.casefold() == normalized:
                 return name
-    raise ValueError("Usage TierはFree / Build / Launch / Growから選択してください")
+    raise ValueError("Usage TierはBuild / Launch / Growから選択してください")
 
 
 def usage_tier_qualification(tier: str | int) -> str:
@@ -82,13 +96,55 @@ def group_for_model(model: str) -> str | None:
     return MODEL_GROUPS.get(model.strip())
 
 
+def group_from_rate_limit_headers(
+    headers: Mapping[str, object] | None,
+    tier: str | int,
+) -> str | None:
+    """Resolve a new model's shared group from an API response header.
+
+    OpenAI's public Models API returns only basic model identity fields, not
+    complimentary-token group membership. The preflight response may include
+    ``x-ratelimit-limit-tokens``; only the documented standard values are
+    accepted. Project-specific or missing values intentionally return None.
+    """
+
+    if not isinstance(headers, Mapping):
+        return None
+    current_tier = normalize_usage_tier(tier)
+    raw_value = next(
+        (value for key, value in headers.items() if str(key).casefold() == "x-ratelimit-limit-tokens"),
+        None,
+    )
+    if isinstance(raw_value, int) and raw_value >= 0:
+        token_limit = raw_value
+    elif isinstance(raw_value, str) and _POSITIVE_INTEGER_PATTERN.fullmatch(raw_value.strip()):
+        token_limit = int(raw_value.strip())
+    else:
+        return None
+    return _TOKEN_RATE_LIMIT_GROUPS[current_tier].get(token_limit)
+
+
+def resolve_model_group(
+    model: str,
+    *,
+    headers: Mapping[str, object] | None = None,
+    tier: str | int = "Build",
+) -> str | None:
+    """Resolve a known model or confirm a new one from its API rate limit."""
+
+    known_group = group_for_model(model)
+    if known_group is not None:
+        return known_group
+    return group_from_rate_limit_headers(headers, tier)
+
+
 def limits_for_usage_tier(tier: str | int) -> dict[str, int]:
     current_tier = normalize_usage_tier(tier)
-    # Keep the lower historical allowance for Free and Build. Launch and Grow
-    # use the higher allowance that previously applied from Usage Tier 3 onward.
+    # Eligible Build organizations receive the lower complimentary allowance;
+    # Launch and Grow receive the higher allowance.
     return (
         {"1m": 250_000, "10m": 2_500_000}
-        if current_tier in {"Free", "Build"}
+        if current_tier == "Build"
         else {"1m": 1_000_000, "10m": 10_000_000}
     )
 

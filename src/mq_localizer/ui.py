@@ -1660,10 +1660,8 @@ class MainWindow:
             self._open_settings("openai")
             return
         official_endpoint = is_official_api_base_url(api_base_url)
-        if self.settings.free_tokens_only and (
-            not official_endpoint or group_for_model(self.settings.model) is None
-        ):
-            messagebox.showwarning("無料枠保護", "OpenAI公式APIと無料トークン枠の対象モデルを選択してください。")
+        if self.settings.free_tokens_only and not official_endpoint:
+            messagebox.showwarning("無料枠保護", "無料枠保護はOpenAI公式APIでのみ使用できます。")
             self._open_settings("openai")
             return
         if official_endpoint and not self.session_api_key:
@@ -3363,11 +3361,20 @@ class SettingsDialog:
             tier = normalize_usage_tier(self.usage_tier_var.get())
             limits_for_usage_tier(tier)
             official = is_official_api_base_url(normalize_api_base_url(self.api_base_url_var.get()))
-            group = group_for_model(self.model_var.get()) if official else None
+            model = self.model_var.get().strip()
+            group = group_for_model(model) if official else None
             statuses = QuotaLedger(self.store.path.parent / "openai-usage.json").statuses(tier)
             lines = [
                 f"利用区分: {tier}（{usage_tier_qualification(tier)}）",
-                f"現在のモデル: {GROUP_LABELS[group]}" if group else "無料トークン枠の対象モデルではありません",
+                (
+                    f"現在のモデル: {GROUP_LABELS[group]}"
+                    if group
+                    else (
+                        "現在のモデル: APIの送信前応答からグループを自動確認"
+                        if official and model
+                        else "無料トークン枠の対象モデルを確認できません"
+                    )
+                ),
             ]
             for key, status in statuses.items():
                 lines.append(
@@ -3811,8 +3818,8 @@ class SettingsDialog:
         ttk.Label(quota_box, textvariable=self.quota_status_var, justify="left", wraplength=650).grid(row=2, column=0, columnspan=3, sticky="w")
         ttk.Label(
             quota_box,
-            text=("利用区分の条件: Free=対象地域、Build=累計 $5 購入、"
-                  "Launch=累計 $100 購入、Grow=累計 $500 購入。\n"
+            text=("利用区分の条件: Build=累計 $5 購入、Launch=累計 $100 購入、"
+                  "Grow=累計 $500 購入。Free利用区分はデータ共有トークンの対象外です。\n"
                   "このアプリが送信前に確認するのは日次の共有トークン枠です。"
                   "実際の共有対象・上限・残量はOpenAIのデータ共有設定とUsage Dashboardで確認してください。\n"
                   "共有設定は変更しません。別アプリ・別PC・導入前の消費は集計できず、課金ゼロは保証できません。"

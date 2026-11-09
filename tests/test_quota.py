@@ -33,15 +33,15 @@ class LedgerTests(unittest.TestCase):
         self.ledger = QuotaLedger(self.path, now=lambda: self.now)
 
     def test_groups_and_tiers(self):
-        for model in ("gpt-5.6-sol", "gpt-5.4", "gpt-4o-2024-08-06", "o3"):
+        for model in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.4-2026-03-05", "gpt-4o-2024-08-06", "o3-2025-04-16"):
             self.assertEqual(group_for_model(model), "1m")
-        for model in ("gpt-5.6-terra", "gpt-5.6-luna", "gpt-5-mini", "gpt-4o-mini"):
+        for model in ("gpt-5.6-terra", "gpt-5.6-luna", "gpt-5-mini-2025-08-07", "gpt-4o-mini-2024-07-18"):
             self.assertEqual(group_for_model(model), "10m")
-        for model in ("ft:gpt-5-mini:a", "gpt-5.6-sol-2099-01-01", "gpt-5-pro", "gpt-6-astra", "provider/gpt-5"):
+        for model in ("ft:gpt-5-mini:a", "gpt-5.6", "gpt-5.4", "gpt-5.6-sol-2099-01-01", "gpt-5-pro", "gpt-4o-mini", "provider/gpt-5"):
             self.assertIsNone(group_for_model(model))
         for tier in range(1, 6):
             self.assertEqual(limits_for_usage_tier(tier)["1m"], 250_000 if tier < 3 else 1_000_000)
-        for tier in (0, 6, True, "1"):
+        for tier in (0, 6, True, "1", "Free"):
             with self.assertRaises(ValueError):
                 limits_for_usage_tier(tier)
 
