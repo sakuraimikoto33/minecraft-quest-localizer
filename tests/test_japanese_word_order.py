@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.test_translation_warning_regressions import RecordingAdapter, project_for
+from tests.test_translation_warning_regressions import (
+    RecordingAdapter,
+    RecordingClient,
+    project_for,
+)
 from tests.test_terminal_style_regressions import _glossary
 from tests.test_openai_client import SequenceTransport, _output_text
 from mq_localizer.domain import TranslationError
@@ -12,8 +16,10 @@ from mq_localizer.openai_client import IMMUTABLE_TRANSLATION_PROTOCOL, OpenAICli
 from mq_localizer.protection import TokenProtector
 from mq_localizer.translation_quality import (
     JAPANESE_WORD_ORDER_INSTRUCTIONS,
+    UNSTYLED_NAME_WORD_ORDER_RETRY_INSTRUCTIONS,
     image_title_translation_issue,
     japanese_word_order_issue,
+    repair_unstyled_name_word_order,
 )
 from mq_localizer.translator import (
     TranslationOptions, TranslationService, _existing_translation_is_safe,
@@ -224,6 +230,119 @@ class JapaneseWordOrderTests(unittest.TestCase):
             "JAPANESE WORD-ORDER RETRY",
             transport.calls[1]["payload"]["instructions"],
         )
+
+    def test_unstyled_name_retry_explains_particle_order(self):
+        source = (
+            "The other Printed Circuit Board component, also from the "
+            "&bPressure Chamber&r."
+        )
+        bad_prefix = "は、もう一つのPrinted Circuit Boardコンポーネントで、"
+        good_prefix = "Printed Circuit Boardのもう一つのコンポーネントで、"
+        self.assertIsNotNone(japanese_word_order_issue(
+            source,
+            bad_prefix + "&b圧力チャンバー&rから来ています。",
+            "en_us",
+            "ja_jp",
+        ))
+        self.assertIsNone(japanese_word_order_issue(
+            source,
+            good_prefix + "&b圧力チャンバー&rから来ています。",
+            "en_us",
+            "ja_jp",
+        ))
+        self.assertIn("UNSTYLED NAME WORD-ORDER RETRY", UNSTYLED_NAME_WORD_ORDER_RETRY_INSTRUCTIONS)
+
+    def test_unstyled_other_component_name_is_repaired_conservatively(self):
+        source = (
+            "The other Printed Circuit Board component, also from the "
+            "&bPressure Chamber&r."
+        )
+        bad = "は、もう一つのPrinted Circuit Boardコンポーネントで、&b圧力チャンバー&rから来ています。"
+        self.assertEqual(
+            repair_unstyled_name_word_order(source, bad),
+            "Printed Circuit Boardのもう一つのコンポーネントで、&b圧力チャンバー&rから来ています。",
+        )
+        self.assertIsNone(repair_unstyled_name_word_order(
+            "The Printed Circuit Board is ready.", bad,
+        ))
+
+    def test_unstyled_name_is_repaired_without_retry(self):
+        source = (
+            "The other Printed Circuit Board component, also from the "
+            "&bPressure Chamber&r."
+        )
+        bad_prefix = "は、もう一つのPrinted Circuit Boardコンポーネントで、"
+        good_prefix = "Printed Circuit Boardのもう一つのコンポーネントで、"
+
+        client: RecordingClient
+
+        def translate(item: dict[str, str]) -> str:
+            if "::styled::" in item["id"]:
+                return "圧力チャンバー"
+            token = next(
+                token for token in item["text"].split()
+                if token.startswith("__MQP_")
+            )
+            token = token.rstrip(".")
+            prefix = bad_prefix if len(client.calls) == 1 else good_prefix
+            return prefix + token + "から来ています。"
+
+        client = RecordingClient(translate)
+        adapter = RecordingAdapter()
+        with tempfile.TemporaryDirectory() as directory:
+            project = project_for(source, Path(directory))
+            outcome = TranslationService(client).translate(
+                project,
+                adapter,
+                project.default_output,
+                "test",
+                "model",
+                _glossary(),
+                TranslationOptions(),
+            )
+        self.assertEqual(outcome.translated, 1)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            adapter.translations[0]["u"],
+            "Printed Circuit Boardのもう一つのコンポーネントで、"
+            "&b圧力チャンバー&rから来ています。",
+        )
+
+    def test_reset_free_pack_note_switches_are_translated_without_nested_retries(self):
+        source = (
+            "&7Pack note: &6Extended Crafting&7's &6Chaos Heart Singularity&7, "
+            "part of the &dUltimate Singularity&7, eats a huge pile of these. Start early."
+        )
+        translations = {
+            "Pack note: ": "パックメモ：",
+            "Extended Crafting": "Extended Crafting",
+            "'s ": "の",
+            "Chaos Heart Singularity": "混沌の心シンギュラリティ",
+            ", part of the ": "の一部で",
+            "Ultimate Singularity": "究極のシンギュラリティ",
+            ", eats a huge pile of these. Start early.": "大量に消費します。早めに始めましょう。",
+        }
+        client = RecordingClient(lambda item: translations[item["text"]])
+        adapter = RecordingAdapter()
+        with tempfile.TemporaryDirectory() as directory:
+            project = project_for(source, Path(directory))
+            outcome = TranslationService(client).translate(
+                project,
+                adapter,
+                project.default_output,
+                "test",
+                "model",
+                _glossary(),
+                TranslationOptions(),
+            )
+        self.assertEqual(outcome.translated, 1)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(adapter.translations, [{
+            "u": (
+                "&7パックメモ：&6Extended Crafting&7の&6混沌の心シンギュラリティ&7の一部で"
+                "&d究極のシンギュラリティ&7大量に消費します。早めに始めましょう。"
+            ),
+        }])
 
     def test_power_of_term_retry_moves_the_first_token_before_nos(self):
         source = (

@@ -568,8 +568,12 @@ class ProtectedText:
             self.structural_placeholders,
         )
         source_segments = (
-            [without_leading_styled_article(segment, self.replacements) for segment in
-             _split_on_placeholders(self.protected, self.structural_placeholders)]
+            [
+                without_leading_styled_article(segment, self.replacements)
+                for segment in _split_on_placeholders(
+                    self.protected, self.structural_placeholders,
+                )
+            ]
             if allow_omitted_determiners else None
         )
         if self.structural_placeholders:
@@ -602,6 +606,12 @@ class ProtectedText:
             self.replacements,
             self.term_placeholders,
             source_segments=source_segments,
+            source_layout_segments=[
+                segment
+                for segment in _split_on_placeholders(
+                    self.protected, self.structural_placeholders,
+                )
+            ],
         )
 
         result_chunks: list[str] = []
@@ -1565,8 +1575,18 @@ def _build_formatting_segment(
             if (
                 movable_groups
                 and segment[group[-1][2] :].strip()
-                and all(left[2] == right[1] for left, right in zip(group, group[1:]))
                 and any(_is_color_format_token(replacements[item[0]]) for item in group)
+                # The final unclosed style may contain ordinary text between
+                # colour switches (``&7text&cname&7``).  It is still a single
+                # anchored tail: only the formatting codes must stay in this
+                # order and at the end of the segment.  Requiring adjacent
+                # codes here incorrectly classified a closed group followed by
+                # such a tail as one strict segment, preventing the closed
+                # group from moving with Japanese word order.
+                and not any(
+                    _is_reset_format_token(replacements[item[0]])
+                    for item in group
+                )
             ):
                 trailing_placeholders = tuple(item[0] for item in group)
                 trailing_signatures = _trailing_formatting_signatures(
@@ -1639,6 +1659,7 @@ def _validate_formatting_segments(
     term_placeholders: Iterable[str] = (),
     *,
     source_segments: list[str] | None = None,
+    source_layout_segments: list[str] | None = None,
 ) -> None:
     term_placeholders = frozenset(term_placeholders)
     if len(translated_segments) != len(expected_segments):
@@ -1650,6 +1671,11 @@ def _validate_formatting_segments(
         strict=True,
     )):
         original = source_segments[segment_index] if source_segments is not None else None
+        layout_original = (
+            source_layout_segments[segment_index]
+            if source_layout_segments is not None
+            else original
+        )
         matches = _formatting_placeholder_matches(translated, replacements)
         sequence = tuple(placeholder for placeholder, _start, _end in matches)
         if Counter(sequence) != Counter(expected.source_sequence):
@@ -1693,10 +1719,41 @@ def _validate_formatting_segments(
             signatures = _trailing_formatting_signatures(
                 translated, tail, replacements, term_placeholders=term_placeholders,
             )
-            if signatures != expected.trailing_signatures and not (
-                original is not None and signatures == _trailing_formatting_signatures(
-                    _without_term_determiners(original, term_placeholders), tail, replacements,
-                    term_placeholders=term_placeholders,
+            source_tail_parts = (
+                _split_on_placeholders(layout_original, tail)
+                if layout_original is not None else []
+            )
+            translated_tail_parts = _split_on_placeholders(translated, tail)
+            allow_tail_body_addition = (
+                any(
+                    _segment_signature(part, term_placeholders)[0]
+                    for part in source_tail_parts[1:-1]
+                )
+                or (
+                    bool(source_tail_parts)
+                    and has_protected_possessive_suffix(
+                        source_tail_parts[-1], term_placeholders,
+                    )
+                )
+                or has_protected_possessive_suffix(
+                    translated_tail_parts[-1], term_placeholders,
+                )
+            )
+            if not _trailing_formatting_signatures_match(
+                expected.trailing_signatures,
+                signatures,
+                allow_body_addition=allow_tail_body_addition,
+            ) and not (
+                original is not None
+                and _trailing_formatting_signatures_match(
+                    _trailing_formatting_signatures(
+                        _without_term_determiners(original, term_placeholders),
+                        tail,
+                        replacements,
+                        term_placeholders=term_placeholders,
+                    ),
+                    signatures,
+                    allow_body_addition=allow_tail_body_addition,
                 )
             ):
                 raise TranslationError("末尾の未閉鎖装飾をまたいで本文または保護対象が移動しました")
@@ -1913,6 +1970,64 @@ def _trailing_formatting_signatures(
             for part in tail_parts
         ),
     )
+
+
+def _trailing_formatting_signatures_match(
+    expected: tuple[tuple[object, ...], ...],
+    observed: tuple[tuple[object, ...], ...],
+    *,
+    allow_body_addition: bool = False,
+) -> bool:
+    """Compare an anchored unclosed tail without freezing translated prose.
+
+    The formatting placeholders and any protected syntax inside each interval
+    remain fixed.  The boolean part of ``_segment_signature`` only says that
+    an interval contains visible text; it is not a stable property when a
+    Japanese sentence moves prose across the final colour switch (for example
+    ``...&cName&7.`` may become ``...&c名前&7から作成します。``).  Punctuation-only
+    labels remain strict so glyphs such as ``+`` cannot be silently changed.
+    """
+
+    if len(expected) != len(observed):
+        return False
+    for expected_part, observed_part in zip(expected, observed, strict=True):
+        if len(expected_part) != 2 or len(observed_part) != 2:
+            return False
+        if expected_part[0] != observed_part[0]:
+            return False
+        expected_intervals = expected_part[1]
+        observed_intervals = observed_part[1]
+        if len(expected_intervals) != len(observed_intervals):
+            return False
+        for expected_interval, observed_interval in zip(
+            expected_intervals,
+            observed_intervals,
+            strict=True,
+        ):
+            if len(expected_interval) != 2 or len(observed_interval) != 2:
+                return False
+            expected_signature, expected_literal = expected_interval
+            observed_signature, observed_literal = observed_interval
+            if expected_signature[1] != observed_signature[1]:
+                return False
+            if expected_signature[0] != observed_signature[0]:
+                # A translated sentence may continue after the last colour
+                # switch, but it must not lose the source body.  The caller
+                # enables this only when an earlier tail interval already
+                # contains ordinary prose or a legitimate possessive suffix.
+                if not (
+                    allow_body_addition
+                    and not expected_signature[0]
+                    and observed_signature[0]
+                ):
+                    return False
+            if (
+                not expected_signature[0]
+                and not observed_signature[0]
+                and expected_literal != observed_literal
+            ):
+                return False
+    return True
 
 
 def _formatting_body_signature(

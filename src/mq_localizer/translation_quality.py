@@ -51,6 +51,15 @@ JAPANESE_WORD_ORDER_RETRY_INSTRUCTIONS = (
     "[source]', put the source first: '[source]からドロップした[item]を使うと'. "
     "Do not return '[item]を使って' with the source introduced afterward."
 )
+UNSTYLED_NAME_WORD_ORDER_RETRY_INSTRUCTIONS = (
+    "UNSTYLED NAME WORD-ORDER RETRY: The source contains a capitalized name that "
+    "is not wrapped in a formatting code (for example 'Printed Circuit Board' or "
+    "'Teleportation Cores'). Treat that name as a semantic noun phrase even when "
+    "it is not an opaque token. Do not begin the Japanese sentence with a dangling "
+    "'は', 'を', 'に', or similar particle and then introduce that name afterward. "
+    "Place the unstyled name before its particle, keep its source relationship to "
+    "the surrounding noun, and do not leave it as a detached final phrase."
+)
 IMAGE_TITLE_RETRY_INSTRUCTIONS = (
     "IMAGE TITLE RETRY: This item is a short image label, not a sentence. Return only "
     "the translated noun phrase corresponding to the source title. Do not append a "
@@ -266,6 +275,57 @@ def _detached_unstyled_name_issue(source: str, candidate: str) -> bool:
         if re.search(rf"(?<![A-Za-z]){re.escape(base)}(?![A-Za-z])", visible_candidate):
             return True
     return False
+
+
+def repair_unstyled_name_word_order(source: str, candidate: str) -> str | None:
+    """Repair one conservative ``the other NAME component`` rendering.
+
+    This is deliberately narrower than the detector.  A retry can still leave
+    the exact English name after a Japanese leading particle even though the
+    surrounding sentence is otherwise valid.  For the common quest pattern
+    ``The other Printed Circuit Board component ...`` the only safe local
+    repair is to move that unchanged name before the possessive ``の`` phrase.
+    Other source constructions remain fail-closed and are sent through the
+    normal retry/partial-save path.
+    """
+
+    groups = _formatting_group_spans(source)
+    if not groups:
+        return None
+    source_prefix = _strip_formatting(source[: groups[0][0]])
+    match = re.search(
+        r"\bthe\s+other\s+(?P<name>"
+        r"[A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*)+"
+        r")\s+component\b",
+        source_prefix,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    name = match.group("name")
+    visible = _strip_formatting(candidate).lstrip()
+    if not _candidate_starts_with_particle(visible):
+        return None
+    name_start = candidate.find(name)
+    if name_start < 0:
+        return None
+    # Do not move a name which is already before the leading particle or is in
+    # a later independent sentence.
+    if name_start <= len(candidate) - len(candidate.lstrip()) + 2:
+        return None
+    if re.search(r"[。！？!?]", _strip_formatting(candidate[:name_start])):
+        return None
+    without_name = candidate[:name_start] + candidate[name_start + len(name):]
+    without_name = re.sub(
+        r"^(?:を|に|で|が|は|と|へ|から|より|まで|の|も)\s*[、,，,]?\s*",
+        "",
+        without_name,
+        count=1,
+    )
+    repaired = name + "の" + without_name
+    if japanese_word_order_issue(source, repaired, "en_us", "ja_jp") is not None:
+        return None
+    return repaired
 
 
 def _dropped_from_using_issue(source: str, candidate: str) -> bool:

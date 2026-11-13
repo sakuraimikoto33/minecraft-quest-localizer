@@ -36,8 +36,10 @@ from .unicode_safety import translation_unicode_issue
 from .translation_quality import (
     IMAGE_TITLE_RETRY_INSTRUCTIONS,
     JAPANESE_WORD_ORDER_RETRY_INSTRUCTIONS,
+    UNSTYLED_NAME_WORD_ORDER_RETRY_INSTRUCTIONS,
     image_title_translation_issue,
     japanese_word_order_issue,
+    repair_unstyled_name_word_order,
 )
 from .quota import ComplimentaryQuotaExhausted, QuotaStatus
 
@@ -346,9 +348,11 @@ def _fixed_unclosed_style_projection(
 
     Unlike a closed span, these bodies cannot move with Japanese word order:
     every later character inherits the preceding codes. Keep the initial
-    stack locally, translate the first body, and append the remaining styled
-    body as a child. Further switches are handled recursively by that child.
-    The complete original layout is still validated after assembly.
+    stack locally and translate each interval between later colour switches as
+    an independent child. Keeping every switch in the parent projection would
+    invite the model to move prose across an inherited colour; recursively
+    projecting one large child had the opposite problem and produced deeply
+    nested ``styled text`` retries for pack notes containing many switches.
     """
     if protected.structural_placeholders or len(protected.formatting_segments) != 1:
         return None
@@ -378,19 +382,65 @@ def _fixed_unclosed_style_projection(
     if body_start == len(source):
         return None
     spans = dict(zip(protected.special_placeholders, protected.special_source_spans, strict=True))
-    original_start = spans[tokens[index - 1]][1]
+    remaining_tokens = tokens[index - 1:]
+    positions = [source.find(token, prefix_end) for token in remaining_tokens]
+    if any(position < 0 for position in positions):
+        raise TranslationError("内部エラー: 未閉鎖装飾範囲の位置を特定できません")
+
+    # Group adjacent formatting codes into one opening stack, then create a
+    # child for the visible interval that follows it.  No formatting token is
+    # left in a child source, so _make_prepared_part cannot recursively split
+    # the same unclosed tail again.
+    suffix_bodies: list[_StyledBodyProjection] = []
+    pending_opening_start: int | None = None
+    token_index = 0
+    while token_index < len(remaining_tokens):
+        token_start = positions[token_index]
+        if pending_opening_start is None:
+            pending_opening_start = token_start
+        opening_end = token_start + len(remaining_tokens[token_index])
+        token_index += 1
+        while (
+            token_index < len(remaining_tokens)
+            and positions[token_index] == opening_end
+        ):
+            opening_end = positions[token_index] + len(remaining_tokens[token_index])
+            token_index += 1
+        body_end = (
+            positions[token_index]
+            if token_index < len(remaining_tokens)
+            else len(source)
+        )
+        body = source[opening_end:body_end]
+        if not body:
+            continue
+        opening = source[pending_opening_start:opening_end]
+        last_token = remaining_tokens[token_index - 1]
+        body_source_start = spans[last_token][1]
+        next_source_start = (
+            spans[remaining_tokens[token_index]][0]
+            if token_index < len(remaining_tokens)
+            else len(protected.original)
+        )
+        suffix_bodies.append(_StyledBodyProjection(
+            part_id=f"{part_id}::styled::{len(suffix_bodies):04d}",
+            provider_token="",
+            source_text=protected.original[body_source_start:next_source_start],
+            opening=opening,
+            reset="",
+            source_start=body_source_start,
+            protected_body=body,
+        ))
+        pending_opening_start = None
+
+    fixed_suffix = ""
+    if pending_opening_start is not None:
+        fixed_suffix = source[pending_opening_start:]
     return _ProviderProjection(
         text=source[prefix_end:start],
         fixed_prefix=source[:prefix_end],
-        local_suffix_bodies=(_StyledBodyProjection(
-            part_id=f"{part_id}::styled::0000",
-            provider_token="",
-            source_text=protected.original[original_start:],
-            opening=source[start:body_start],
-            reset="",
-            source_start=original_start,
-            protected_body=source[body_start:],
-        ),),
+        local_suffix_bodies=tuple(suffix_bodies),
+        fixed_suffix=fixed_suffix,
     )
 
 
@@ -602,6 +652,11 @@ class TranslationService:
                     retry_context = (
                         f"{retry_context}\n{JAPANESE_WORD_ORDER_RETRY_INSTRUCTIONS}"
                     )
+                    if "装飾のない固有名詞" in first_reason:
+                        retry_context = (
+                            f"{retry_context}\n"
+                            f"{UNSTYLED_NAME_WORD_ORDER_RETRY_INSTRUCTIONS}"
+                        )
                 if "画像タイトルに説明文" in first_reason:
                     retry_context = f"{retry_context}\n{IMAGE_TITLE_RETRY_INSTRUCTIONS}"
                 retry_items = [
@@ -1779,6 +1834,16 @@ def _restore_bundle_response(
             quality_issue = image_title_translation_issue(
                 root.unit_key, root.protected.original, restored_parts[root.id], target_locale,
             )
+        if quality_issue is not None and "装飾のない固有名詞" in quality_issue:
+            repaired = repair_unstyled_name_word_order(
+                root.protected.original,
+                restored_parts[root.id],
+            )
+            if repaired is not None:
+                restored_parts[root.id] = repaired
+                quality_issue = japanese_word_order_issue(
+                    root.protected.original, repaired, source_locale, target_locale,
+                )
         if quality_issue:
             return {}, (root, TranslationError(quality_issue))
     return restored_parts, None

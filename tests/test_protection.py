@@ -678,6 +678,42 @@ class TokenProtectorTests(unittest.TestCase):
                 with self.assertRaises(TranslationError):
                     protected.restore(protected.protected.removeprefix("Use ") + "を使う")
 
+    def test_closed_group_can_move_before_anchored_unclosed_tail(self) -> None:
+        # Draconic Evolution uses a normal reset-closed name followed by a
+        # terminal colour tail whose last code is another colour switch rather
+        # than ``&r``.  The closed name may move before Japanese prose, but the
+        # unclosed tail must remain at the end so its inherited style cannot
+        # bleed into the preceding sentence.
+        source = (
+            "Face &dCrafting Injectors&r toward the core: the catalyst goes in "
+            "the core, the ingredients in the injectors, and the injectors need "
+            "power. &7The core itself comes from a &cFlux Crafter&7."
+        )
+        protected = self.protector.protect(source)
+        formatting = protected.formatting_segments[0]
+        self.assertFalse(formatting.strict_segment_signatures)
+        self.assertEqual(len(formatting.movable_groups), 1)
+        self.assertEqual(
+            tuple(protected.replacements[token] for token in formatting.trailing_placeholders),
+            ("&7", "&c", "&7"),
+        )
+        tokens = list(protected.replacements)
+        candidate = (
+            tokens[0] + "クラフティングインジェクター" + tokens[1]
+            + "をコアに向けます。触媒はコアに、素材はインジェクターに入れ、"
+            "インジェクターには電力が必要です。"
+            + tokens[2] + "コア自体は" + tokens[3] + "フラックスクラフター"
+            + tokens[4] + "から作られます。"
+        )
+        self.assertEqual(
+            protected.restore(candidate),
+            (
+                "&dクラフティングインジェクター&rをコアに向けます。触媒はコアに、"
+                "素材はインジェクターに入れ、インジェクターには電力が必要です。"
+                "&7コア自体は&cフラックスクラフター&7から作られます。"
+            ),
+        )
+
     def test_white_boundary_with_initially_inherited_compound_color_stays_strict(
         self,
     ) -> None:
